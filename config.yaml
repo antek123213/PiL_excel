@@ -1,0 +1,105 @@
+# ===========================================================================
+# config.yaml – konfiguracja miesięcznego raportu TVM P&L
+# ===========================================================================
+# UWAGA: Skopiuj ten plik jako config.local.yaml i uzupełnij hasła/połączenia.
+#        config.local.yaml jest wykluczony z repozytorium (.gitignore).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Okres raportowy
+# ---------------------------------------------------------------------------
+reporting:
+  # Domyślny okres: poprzedni pełny miesiąc (auto).
+  # Aby nadpisać ręcznie, użyj parametru --month YYYY-MM przy uruchamianiu.
+  default_period: auto   # "auto" | "YYYY-MM"
+
+# ---------------------------------------------------------------------------
+# Źródło danych – baza danych (obroty, informacje o automatach)
+# ---------------------------------------------------------------------------
+database:
+  # Typ: mssql | mysql | postgresql | sqlite
+  type: mssql
+  host: "localhost"
+  port: 1433
+  name: "tvm_db"
+  user: "tvm_user"
+  password: ""           # uzupełnij w config.local.yaml lub przez zmienną DB_PASSWORD
+  # Nazwy tabel
+  tables:
+    automaty: "automaty"            # tabela z danymi 1-INFO
+    transakcje: "transakcje"        # tabela z danymi 2-OBRÓT
+    koszty: "tvm_koszty"            # tabela z danymi 5-KOSZTY (po migracji)
+
+# ---------------------------------------------------------------------------
+# Źródło kosztów (5-KOSZTY)
+# ---------------------------------------------------------------------------
+costs:
+  # "csv"      – dane z pliku kas.csv (domyślnie)
+  # "excel"    – dane z pliku kas.xlsx
+  # "database" – dane z tabeli DB (po migracji)
+  source: csv
+  csv_path: "kas.csv"
+  excel_path: "kas.xlsx"
+  excel_sheet: "Koszty"
+
+# ---------------------------------------------------------------------------
+# Stawki prowizji i podatki (3-PROWIZJA, 4-PODATEK)
+# ---------------------------------------------------------------------------
+commission_rates:
+  # Stawka ELAVON (domyślna)
+  elavon_default: 0.0125   # 1.25%
+  # Stawki interchange per przewoźnik (klucz = nazwa przewoźnika z DB)
+  interchange_per_carrier:
+    "PKP IC":   0.0080     # 0.80%
+    "PKS":      0.0100     # 1.00%
+    "default":  0.0100     # domyślna dla nieznanych przewoźników
+
+tax:
+  vat_rate: 0.23            # 23%
+  method: "from_gross"      # "from_gross" = VAT zawarty w cenie (metoda „od stu")
+
+# ---------------------------------------------------------------------------
+# Ścieżki wyjściowe
+# ---------------------------------------------------------------------------
+output:
+  directory: "output"
+  excel_filename: "TVM_PL_{year}_{month:02d}.xlsx"   # np. TVM_PL_2026_02.xlsx
+  csv_audit_filename: "TVM_PL_{year}_{month:02d}_audit.csv"
+  snapshots_directory: "snapshots"   # snapshoty INFO (1-INFO change tracking)
+
+# ---------------------------------------------------------------------------
+# Powiadomienia e-mail
+# ---------------------------------------------------------------------------
+email:
+  enabled: false           # zmień na true po konfiguracji
+  smtp_host: "smtp.example.com"
+  smtp_port: 587
+  smtp_use_tls: true
+  from_address: "raporty@example.com"
+  from_password: ""        # uzupełnij w config.local.yaml lub przez zmienną EMAIL_PASSWORD
+  to_addresses:
+    - "manager@example.com"
+  subject: "Raport TVM P&L {year}-{month:02d}"
+  # KPI w treści wiadomości: obrot, prowizja, koszty, wynik_netto, status
+
+# ---------------------------------------------------------------------------
+# Powiadomienia Microsoft Teams (webhook)
+# ---------------------------------------------------------------------------
+teams:
+  enabled: false           # zmień na true po konfiguracji
+  webhook_url: ""          # uzupełnij w config.local.yaml
+
+# ---------------------------------------------------------------------------
+# Progi alertów / anomalie (dla 8-UWAGI)
+# ---------------------------------------------------------------------------
+alerts:
+  wynik_netto_min: -500.00  # wynik poniżej progu → automatyczna uwaga w 8-UWAGI
+
+# ---------------------------------------------------------------------------
+# Harmonogram (dokumentacyjnie – patrz scheduler/task_scheduler.md)
+# ---------------------------------------------------------------------------
+schedule:
+  # Windows Task Scheduler: 1. dzień miesiąca, godz. 01:00
+  trigger: "monthly"
+  day_of_month: 1
+  time: "01:00"

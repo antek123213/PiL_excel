@@ -1,0 +1,21 @@
+# Zależności Python – TVM P&L Monthly Report
+
+# Konfiguracja
+PyYAML>=6.0
+
+# Przetwarzanie danych i eksport Excel
+pandas>=2.0
+openpyxl>=3.1
+
+# Baza danych (SQLAlchemy + sterowniki)
+SQLAlchemy>=2.0
+# Sterowniki – odkomentuj odpowiedni dla swojej bazy danych:
+# pyodbc>=4.0        # MS SQL Server (MSSQL)
+# pymysql>=1.1       # MySQL / MariaDB
+# psycopg2-binary>=2.9  # PostgreSQL
+
+# Powiadomienia Teams
+requests>=2.28
+
+# Opcjonalnie: wczytywanie zmiennych środowiskowych z pliku .env
+# python-dotenv>=1.0

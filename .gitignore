@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Report outputs (generated files – do not commit)
+output/
+*.xlsx
+*.csv
+
+# Snapshots directory (runtime state – should not be committed)
+snapshots/
+
+# Logs
+*.log
+logs/
+
+# Secrets / local overrides
+config.local.yaml
+secrets.yaml

@@ -1,0 +1,136 @@
+=====================================================================
+  REGUŁY BIZNESOWE – TABELA GŁÓWNA TVM P&L  (kolumny 1–8)
+=====================================================================
+Wersja: 1.0  |  Data: 2026-03
+
+---------------------------------------------------------------------
+1-INFO  (informacje opisowe o automacie)
+---------------------------------------------------------------------
+Pobierane raz na miesiąc; porównanie ze snapshotem poprzedniego
+miesiąca; aktualizacja tylko przy zmianie.
+
+Pola:
+  nr_automatu     – unikalny identyfikator automatu (klucz złączenia)
+  lokalizacja     – adres / opis miejsca
+  przewoźnik      – nazwa przewoźnika obsługującego automat
+  operator        – operator płatności (np. ELAVON)
+  segment         – segment handlowy (OM / Nord / marketing / inne)
+  status          – AKTYWNY / NIEAKTYWNY / SERWIS
+  data_instalacji – data uruchomienia automatu
+
+Reguła zmiany:
+  Jeśli dane INFO z bieżącego miesiąca różnią się od snapshotu
+  poprzedniego miesiąca → zapisz nowy snapshot + oznacz zmianę
+  w kolumnie 8-UWAGI (automatyczne "INFO ZMIANA: <pole>=<nowa wartość>").
+
+---------------------------------------------------------------------
+2-OBRÓT  (obrót miesięczny)
+---------------------------------------------------------------------
+Źródło: baza danych (tabela transakcji).
+Klucz:  nr_automatu + rok + miesiąc.
+
+Pola:
+  obrot_brutto    – suma transakcji brutto w miesiącu [PLN]
+  liczba_transakcji – liczba transakcji w miesiącu
+  srednia_transakcja – obrot_brutto / liczba_transakcji [PLN]
+
+Reguła:
+  Pobierane zawsze dla wskazanego miesiąca raportowego.
+
+---------------------------------------------------------------------
+3-PROWIZJA  (prowizja od obrotu)
+---------------------------------------------------------------------
+Źródło: kalkulacja na podstawie 2-OBRÓT i taryf przewoźnika.
+
+Składowe:
+  prowizja_elavon       – prowizja ELAVON = obrot_brutto * stawka_elavon
+                          (stawka_elavon z config, domyślnie 0.0125 = 1.25%)
+  prowizja_interchange  – interchange = obrot_brutto * stawka_interchange
+                          (stawka z config, zależy od przewoźnika)
+  prowizja_total        – prowizja_elavon + prowizja_interchange
+
+Reguła:
+  Stawki mogą być różne per przewoźnik – mapowanie w config.yaml
+  (sekcja commission_rates).
+
+---------------------------------------------------------------------
+4-PODATEK  (podatek)
+---------------------------------------------------------------------
+Źródło: kalkulacja na podstawie 2-OBRÓT.
+
+Definicja:
+  Podstawa opodatkowania = obrot_brutto (sprzedaż brutto).
+  VAT należny = obrot_brutto * stawka_vat / (1 + stawka_vat)
+                (VAT zawarty w cenie – metoda „od stu")
+  Obrót netto  = obrot_brutto - VAT_nalezny
+  stawka_vat   = zdefiniowana w config.yaml (domyślnie 0.23)
+
+Pola:
+  obrot_netto   – obrót bez VAT [PLN]
+  vat_nalezny   – VAT zawarty w obrocie [PLN]
+  obrot_brutto  – (powtórzenie z 2-OBRÓT dla weryfikacji)
+
+---------------------------------------------------------------------
+5-KOSZTY  (koszty zewnętrzne)
+---------------------------------------------------------------------
+Źródło: Excel/CSV (przyszłościowo: baza danych).
+Klucz:  nr_automatu + rok + miesiąc.
+
+Pozycje kosztów:
+  koszt_czynsz        – czynsz za lokalizację automatu [PLN/m-c]
+  koszt_prad          – energia elektryczna [PLN/m-c]
+  koszt_elavon        – opłata miesięczna ELAVON (terminal) [PLN/m-c]
+  koszt_poczta        – usługi pocztowe/kurierskie [PLN/m-c]
+  koszt_amortyzacja   – amortyzacja automatu [PLN/m-c]
+  koszt_serwis        – koszty serwisu technicznego [PLN/m-c]
+  koszt_transmisja    – łączność/transmisja danych [PLN/m-c]
+  koszt_pozostale     – pozostałe koszty operacyjne [PLN/m-c]
+  koszty_total        – suma wszystkich pozycji
+
+Reguła:
+  Jeśli brak danych kosztowych dla danego automatu w danym miesiącu
+  → koszty_total = 0 + ostrzeżenie w logu.
+
+---------------------------------------------------------------------
+6-PO SUMIE  (wynik netto)
+---------------------------------------------------------------------
+Kalkulacja:
+  wynik_netto = obrot_netto
+                - prowizja_total
+                - koszty_total
+  (VAT jest odprowadzany osobno i nie pomniejsza wyniku operacyjnego)
+
+Dodatkowe pola:
+  wynik_brutto    = obrot_brutto - prowizja_total - koszty_total
+  marza_netto_pct = wynik_netto / obrot_netto * 100  [%]
+  segment         – tag segmentu z 1-INFO (OM / Nord / marketing / inne)
+
+---------------------------------------------------------------------
+7-PODSUMOWANIE ROCZNE
+---------------------------------------------------------------------
+Agregacja roczna dla danego automatu (lub wszystkich):
+  rok               – rok raportowy
+  nr_automatu       – (opcjonalnie: filtr)
+  obrot_brutto_ytd  – suma obrotu brutto od początku roku
+  prowizja_ytd      – suma prowizji od początku roku
+  koszty_ytd        – suma kosztów od początku roku
+  wynik_netto_ytd   – suma wyniku netto od początku roku
+  liczba_miesiecy   – liczba miesięcy z danymi w danym roku
+
+Reguła:
+  Obliczane zawsze jako suma miesięcy 1-12 z dostępnych danych
+  (nie ekstrapolacja). Filtrowanie po roku i nr_automatu.
+
+---------------------------------------------------------------------
+8-UWAGI
+---------------------------------------------------------------------
+Pole narracyjne / manualne.
+Wypełniane przez operatora lub automatycznie przy:
+  - zmianie INFO (patrz reguła w 1-INFO)
+  - błędzie pobierania danych (brak obrotu, brak kosztów)
+  - anomalii wyniku (wynik_netto < próg z config)
+
+Priorytety wypełnienia:
+  1. Automatyczne wpisy systemowe (zmiany INFO, błędy)
+  2. Manualne uwagi operatora (mogą nadpisać lub uzupełnić)
+=====================================================================

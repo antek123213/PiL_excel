@@ -1,0 +1,53 @@
+=====================================================================
+  KAS – DANE CZYNSZOWE I KOSZTY ZEWNĘTRZNE AUTOMATÓW TVM
+=====================================================================
+Plik używany jako źródło danych dla kolumny 5-KOSZTY.
+Format: tekstowy (opis struktury); dane właściwe w kas.csv / kas.xlsx.
+
+---------------------------------------------------------------------
+STRUKTURA PLIKU KAS.CSV / KAS.XLSX
+---------------------------------------------------------------------
+Nagłówek (pierwsza linia CSV lub pierwszy wiersz arkusza):
+  nr_automatu, rok, miesiac,
+  koszt_czynsz, koszt_prad, koszt_elavon, koszt_poczta,
+  koszt_amortyzacja, koszt_serwis, koszt_transmisja, koszt_pozostale,
+  uwagi_koszty
+
+Typy danych:
+  nr_automatu       – tekst (identyczny z kluczem w bazie danych)
+  rok               – liczba całkowita (np. 2026)
+  miesiac           – liczba całkowita 1-12
+  koszt_*           – liczba dziesiętna, 2 miejsca po przecinku [PLN]
+  uwagi_koszty      – tekst opcjonalny
+
+Przykładowe wiersze (kas.csv):
+  nr_automatu,rok,miesiac,koszt_czynsz,koszt_prad,koszt_elavon,koszt_poczta,koszt_amortyzacja,koszt_serwis,koszt_transmisja,koszt_pozostale,uwagi_koszty
+  TVM-001,2026,2,1200.00,85.50,49.00,12.00,250.00,0.00,35.00,0.00,
+  TVM-002,2026,2,800.00,60.00,49.00,0.00,250.00,150.00,35.00,25.00,serwis wymiana kasety
+
+---------------------------------------------------------------------
+REGUŁY WALIDACJI KOSZTÓW
+---------------------------------------------------------------------
+1. nr_automatu musi być niepusty i istnieć w bazie danych (1-INFO).
+2. Rok i miesiąc muszą odpowiadać okresowi raportowemu.
+3. Wszystkie pozycje koszt_* >= 0.
+4. Brakujące wiersze → koszty_total = 0 + ostrzeżenie.
+
+---------------------------------------------------------------------
+MAPOWANIE DO KOLUMNY 5-KOSZTY
+---------------------------------------------------------------------
+  koszty_total = SUM(koszt_czynsz, koszt_prad, koszt_elavon,
+                     koszt_poczta, koszt_amortyzacja, koszt_serwis,
+                     koszt_transmisja, koszt_pozostale)
+
+---------------------------------------------------------------------
+PRZYSZŁOŚCIOWA MIGRACJA DO BAZY DANYCH
+---------------------------------------------------------------------
+Docelowo dane z kas.csv/kas.xlsx zostaną załadowane do tabeli DB:
+  tvm_koszty (nr_automatu, rok, miesiac, koszt_czynsz, koszt_prad,
+              koszt_elavon, koszt_poczta, koszt_amortyzacja,
+              koszt_serwis, koszt_transmisja, koszt_pozostale,
+              uwagi_koszty)
+Przełączenie odbywa się przez zmianę parametru cost_source w
+config.yaml (csv → database) bez modyfikacji logiki kolumn 3-6.
+=====================================================================
