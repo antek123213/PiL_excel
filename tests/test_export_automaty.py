@@ -26,7 +26,9 @@ from export_automaty import (
     calculate_tax,
     calculate_wynik,
     detect_info_changes,
+    fetch_prowizja_from_db,
     load_costs_from_csv,
+    load_prowizja,
     load_snapshot,
     month_date_range,
     resolve_reporting_period,
@@ -594,3 +596,184 @@ class TestValidateSqlIdentifier:
     def test_identifier_with_space_raises(self):
         with pytest.raises(ValueError):
             _validate_sql_identifier("my table")
+
+
+# ---------------------------------------------------------------------------
+# load_prowizja – commission adapter
+# ---------------------------------------------------------------------------
+
+SAMPLE_PROWIZJA_DB = {
+    "prowizja_elavon": 150.0,
+    "prowizja_interchange": 90.0,
+    "prowizja_total": 240.0,
+    "stawka_elavon_pct": 1.5,
+    "stawka_interchange_pct": 0.9,
+}
+
+
+class TestLoadProwizja:
+    """Tests for the commission source adapter (calculated vs database)."""
+
+    def _make_info_map(self) -> dict:
+        return {"TVM-001": SAMPLE_INFO}
+
+    def _make_obrot_map(self, obrot_brutto: float = 10000.0) -> dict:
+        return {
+            "TVM-001": {
+                "nr_automatu": "TVM-001",
+                "obrot_brutto": obrot_brutto,
+                "liczba_transakcji": 200,
+                "srednia_transakcja": obrot_brutto / 200,
+            }
+        }
+
+    def test_calculated_source_uses_config_rates(self):
+        """source='calculated' computes commissions from config rates."""
+        cfg = make_cfg()
+        result = load_prowizja(
+            cfg=cfg,
+            engine=None,
+            year=2026,
+            month=2,
+            info_map=self._make_info_map(),
+            obrot_map=self._make_obrot_map(10000.0),
+        )
+        assert "TVM-001" in result
+        # PKP IC: elavon 1.25% + interchange 0.80% = 205.00
+        assert result["TVM-001"]["prowizja_total"] == pytest.approx(205.0)
+        assert result["TVM-001"]["prowizja_elavon"] == pytest.approx(125.0)
+        assert result["TVM-001"]["prowizja_interchange"] == pytest.approx(80.0)
+
+    def test_calculated_source_default_when_source_key_missing(self):
+        """Omitting the 'source' key defaults to 'calculated'."""
+        cfg = make_cfg()
+        # Remove 'source' key if present
+        cfg["commission_rates"].pop("source", None)
+        result = load_prowizja(
+            cfg=cfg,
+            engine=None,
+            year=2026,
+            month=2,
+            info_map=self._make_info_map(),
+            obrot_map=self._make_obrot_map(5000.0),
+        )
+        assert "TVM-001" in result
+        assert result["TVM-001"]["prowizja_total"] == pytest.approx(102.5)
+
+    def test_calculated_zero_obrot(self):
+        """Zero turnover produces zero commissions."""
+        cfg = make_cfg()
+        result = load_prowizja(
+            cfg=cfg,
+            engine=None,
+            year=2026,
+            month=2,
+            info_map=self._make_info_map(),
+            obrot_map={},
+        )
+        assert result["TVM-001"]["prowizja_total"] == 0.0
+
+    def test_database_source_returns_db_records(self, monkeypatch):
+        """source='database' returns records fetched from the DB table."""
+        cfg = make_cfg()
+        cfg["commission_rates"]["source"] = "database"
+        cfg["database"]["tables"]["prowizje"] = "tvm_prowizje"
+
+        expected = {"TVM-001": dict(SAMPLE_PROWIZJA_DB)}
+
+        # Patch fetch_prowizja_from_db to return our expected data without a real engine
+        import export_automaty as mod
+        monkeypatch.setattr(mod, "fetch_prowizja_from_db", lambda engine, year, month, table: expected)
+
+        result = load_prowizja(
+            cfg=cfg,
+            engine=object(),  # dummy engine – patched away
+            year=2026,
+            month=2,
+            info_map=self._make_info_map(),
+            obrot_map=self._make_obrot_map(),
+        )
+        assert result == expected
+
+    def test_database_source_overrides_calculated_values(self, monkeypatch):
+        """DB-sourced prowizja_total differs from the calculated value."""
+        cfg = make_cfg()
+        cfg["commission_rates"]["source"] = "database"
+        cfg["database"]["tables"]["prowizje"] = "tvm_prowizje"
+
+        db_data = {"TVM-001": dict(SAMPLE_PROWIZJA_DB)}  # prowizja_total=240, not 205
+
+        import export_automaty as mod
+        monkeypatch.setattr(mod, "fetch_prowizja_from_db", lambda *a, **kw: db_data)
+
+        result = load_prowizja(
+            cfg=cfg, engine=object(),
+            year=2026, month=2,
+            info_map=self._make_info_map(),
+            obrot_map=self._make_obrot_map(10000.0),
+        )
+        # Should use 240.0 from DB, not 205.0 from config rates
+        assert result["TVM-001"]["prowizja_total"] == 240.0
+
+
+class TestAssembleReportRowWithProwizja:
+    """Tests for assemble_report_row when prowizja is pre-loaded from DB."""
+
+    def test_pre_loaded_prowizja_used_directly(self):
+        """Passing prowizja kwarg overrides config-rate calculation."""
+        cfg = make_cfg()
+        row = assemble_report_row(
+            info=SAMPLE_INFO,
+            obrot=SAMPLE_OBROT,
+            costs=SAMPLE_COSTS,
+            cfg=cfg,
+            info_changes=[],
+            year=2026,
+            month=2,
+            prowizja=SAMPLE_PROWIZJA_DB,
+        )
+        # DB record has prowizja_total=240, not the config-calculated 205
+        assert row["prowizja_total"] == 240.0
+        assert row["prowizja_elavon"] == 150.0
+        assert row["prowizja_interchange"] == 90.0
+        assert row["stawka_elavon_pct"] == 1.5
+
+    def test_none_prowizja_falls_back_to_calculation(self):
+        """prowizja=None (default) falls back to config-rate calculation."""
+        cfg = make_cfg()
+        row = assemble_report_row(
+            info=SAMPLE_INFO,
+            obrot=SAMPLE_OBROT,
+            costs=SAMPLE_COSTS,
+            cfg=cfg,
+            info_changes=[],
+            year=2026,
+            month=2,
+            prowizja=None,
+        )
+        # Config rates: PKP IC → elavon 1.25% + interchange 0.80% = 205.00
+        assert row["prowizja_total"] == pytest.approx(205.0)
+
+    def test_wynik_netto_uses_db_prowizja(self):
+        """Net result is computed using the DB-sourced commission, not config rates."""
+        cfg = make_cfg()
+        row_calc = assemble_report_row(
+            info=SAMPLE_INFO, obrot=SAMPLE_OBROT, costs=SAMPLE_COSTS,
+            cfg=cfg, info_changes=[], year=2026, month=2, prowizja=None,
+        )
+        row_db = assemble_report_row(
+            info=SAMPLE_INFO, obrot=SAMPLE_OBROT, costs=SAMPLE_COSTS,
+            cfg=cfg, info_changes=[], year=2026, month=2, prowizja=SAMPLE_PROWIZJA_DB,
+        )
+        # DB prowizja (240) > calculated (205) → lower net result
+        assert row_db["wynik_netto"] < row_calc["wynik_netto"]
+        diff = round(row_calc["wynik_netto"] - row_db["wynik_netto"], 2)
+        assert diff == pytest.approx(240.0 - 205.0)
+
+
+class TestFetchProwizjaFromDb:
+    """Tests for fetch_prowizja_from_db SQL identifier validation."""
+
+    def test_invalid_table_name_raises(self):
+        with pytest.raises(ValueError, match="Nieprawidłowa nazwa"):
+            fetch_prowizja_from_db(None, 2026, 2, "bad; DROP TABLE--")

@@ -28,6 +28,7 @@ database:
   tables:
     automaty: "automaty"            # tabela z danymi 1-INFO
     transakcje: "transakcje"        # tabela z danymi 2-OBRÓT
+    prowizje: "tvm_prowizje"        # tabela z danymi 3-PROWIZJA (gdy source: database)
     koszty: "tvm_koszty"            # tabela z danymi 5-KOSZTY (po migracji)
 
 # ---------------------------------------------------------------------------
@@ -46,7 +47,12 @@ costs:
 # Stawki prowizji i podatki (3-PROWIZJA, 4-PODATEK)
 # ---------------------------------------------------------------------------
 commission_rates:
-  # Stawka ELAVON (domyślna)
+  # Źródło danych prowizji:
+  # "calculated" – obliczane ze stawek poniżej (domyślnie)
+  # "database"   – pobierane z tabeli DB (database.tables.prowizje)
+  #                na tej samej zasadzie co 2-OBRÓT z tabeli transakcje
+  source: calculated
+  # Stawka ELAVON (domyślna, używana gdy source: calculated)
   elavon_default: 0.0125   # 1.25%
   # Stawki interchange per przewoźnik (klucz = nazwa przewoźnika z DB)
   interchange_per_carrier:

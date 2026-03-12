@@ -321,15 +321,24 @@ def fetch_obrot_from_db(engine, year: int, month: int, table: str) -> list[dict]
 
 
 # ---------------------------------------------------------------------------
-# 3-PROWIZJA – commission calculation
+# 3-PROWIZJA – commission calculation and DB fetch
 # ---------------------------------------------------------------------------
+
+COMMISSION_FIELDS = [
+    "prowizja_elavon",
+    "prowizja_interchange",
+    "prowizja_total",
+    "stawka_elavon_pct",
+    "stawka_interchange_pct",
+]
+
 
 def calculate_commission(
     obrot_brutto: float,
     przewoznik: str,
     commission_cfg: dict,
 ) -> dict:
-    """Calculate ELAVON and interchange commissions."""
+    """Calculate ELAVON and interchange commissions from config rates."""
     elavon_rate = float(commission_cfg.get("elavon_default", 0.0125))
 
     interchange_rates = commission_cfg.get("interchange_per_carrier", {})
@@ -349,6 +358,74 @@ def calculate_commission(
         "stawka_elavon_pct": round(elavon_rate * 100, 4),
         "stawka_interchange_pct": round(interchange_rate * 100, 4),
     }
+
+
+def fetch_prowizja_from_db(
+    engine: Any, year: int, month: int, table: str
+) -> dict[str, dict]:
+    """Fetch commission records for the given month from the database.
+
+    Expected table columns: nr_automatu, rok, miesiac,
+    prowizja_elavon, prowizja_interchange, prowizja_total,
+    stawka_elavon_pct, stawka_interchange_pct.
+
+    Returns a dict keyed by nr_automatu.
+    """
+    table = _validate_sql_identifier(table)
+    cols = ", ".join(_validate_sql_identifier(f) for f in COMMISSION_FIELDS)
+    query = f"""
+        SELECT nr_automatu, {cols}
+        FROM {table}
+        WHERE rok = :year AND miesiac = :month
+    """
+    if not _PANDAS_AVAILABLE:
+        raise RuntimeError("Pakiet pandas jest wymagany.")
+    df = pd.read_sql(query, engine, params={"year": int(year), "month": int(month)})
+    result: dict[str, dict] = {}
+    for _, row in df.iterrows():
+        key = str(row["nr_automatu"])
+        result[key] = {
+            field: float(row.get(field, 0) or 0) for field in COMMISSION_FIELDS
+        }
+    return result
+
+
+def load_prowizja(
+    cfg: dict,
+    engine: Any,
+    year: int,
+    month: int,
+    info_map: dict[str, dict],
+    obrot_map: dict[str, dict],
+) -> dict[str, dict]:
+    """Commission source adapter: 'calculated' (config rates) | 'database'.
+
+    Returns a dict keyed by nr_automatu with commission fields.
+    When source is 'calculated', commissions are derived from config rates
+    and the turnover already loaded for each automat.
+    When source is 'database', values are fetched directly from a DB table,
+    mirroring how turnover is fetched from the transakcje table.
+    """
+    commission_cfg = cfg.get("commission_rates", {})
+    source = commission_cfg.get("source", "calculated").lower()
+
+    if source == "database":
+        table = cfg["database"]["tables"]["prowizje"]
+        db_records = fetch_prowizja_from_db(engine, year, month, table)
+        log.info(
+            "Pobrano dane prowizji z bazy danych dla %d automatów.", len(db_records)
+        )
+        return db_records
+
+    # "calculated" – derive from config rates and turnover already loaded
+    result: dict[str, dict] = {}
+    for nr, info in info_map.items():
+        obrot_brutto = float(obrot_map.get(nr, {}).get("obrot_brutto", 0))
+        result[nr] = calculate_commission(
+            obrot_brutto, info.get("przewoznik", ""), commission_cfg
+        )
+    log.info("Prowizja obliczona ze stawek konfiguracyjnych dla %d automatów.", len(result))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -569,19 +646,28 @@ def assemble_report_row(
     info_changes: list[str],
     year: int,
     month: int,
+    prowizja: dict | None = None,
 ) -> dict:
-    """Build a single report row (all 8 columns) for one automat."""
+    """Build a single report row (all 8 columns) for one automat.
+
+    The *prowizja* argument accepts a pre-loaded commission record (e.g. fetched
+    from the database via load_prowizja).  When None the commission is calculated
+    on-the-fly from config rates, preserving backwards compatibility.
+    """
     nr = info["nr_automatu"]
     obrot_brutto = float(obrot.get("obrot_brutto", 0)) if obrot else 0.0
     liczba_transakcji = int(obrot.get("liczba_transakcji", 0)) if obrot else 0
     srednia_transakcja = float(obrot.get("srednia_transakcja", 0)) if obrot else 0.0
 
-    # 3-PROWIZJA
-    commission = calculate_commission(
-        obrot_brutto,
-        info.get("przewoznik", ""),
-        cfg.get("commission_rates", {}),
-    )
+    # 3-PROWIZJA – use pre-loaded record or fall back to calculation
+    if prowizja is not None:
+        commission = prowizja
+    else:
+        commission = calculate_commission(
+            obrot_brutto,
+            info.get("przewoznik", ""),
+            cfg.get("commission_rates", {}),
+        )
 
     # 4-PODATEK
     tax = calculate_tax(obrot_brutto, cfg.get("tax", {}))
@@ -980,6 +1066,9 @@ def run_report(cfg: dict, year: int, month: int) -> int:
         # 5-KOSZTY
         costs_map = load_costs(cfg, engine, year, month)
 
+        # 3-PROWIZJA – via adapter (calculated from rates or fetched from DB)
+        prowizja_map = load_prowizja(cfg, engine, year, month, info_map, obrot_map)
+
         # Assemble rows
         main_rows: list[dict] = []
         for nr, info in info_map.items():
@@ -991,6 +1080,7 @@ def run_report(cfg: dict, year: int, month: int) -> int:
                 info_changes=info_changes.get(nr, []),
                 year=year,
                 month=month,
+                prowizja=prowizja_map.get(nr),
             )
             main_rows.append(row)
 
