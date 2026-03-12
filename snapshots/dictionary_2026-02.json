@@ -1,0 +1,1227 @@
+{
+  "1": {
+    "value": "'1ZTMGDA1'",
+    "description": "1: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "10": {
+    "value": "'1ZTMGDA10'",
+    "description": "10: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "11": {
+    "value": "'1ZTMGDA11'",
+    "description": "11: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1101": {
+    "value": "1101",
+    "description": "38954670",
+    "groupid": "TID"
+  },
+  "1102": {
+    "value": "1102",
+    "description": "2100779044",
+    "groupid": "MID"
+  },
+  "1103": {
+    "value": "1103",
+    "description": "38954676",
+    "groupid": "TID"
+  },
+  "1104": {
+    "value": "1104",
+    "description": "38954677",
+    "groupid": "TID"
+  },
+  "1105": {
+    "value": "1105",
+    "description": "2100854872",
+    "groupid": "MID"
+  },
+  "1106": {
+    "value": "1106",
+    "description": "38955454",
+    "groupid": "TID"
+  },
+  "1107": {
+    "value": "1107",
+    "description": "2100779031",
+    "groupid": "MID"
+  },
+  "1108": {
+    "value": "1108",
+    "description": "2100779012",
+    "groupid": "MID"
+  },
+  "1109": {
+    "value": "1109",
+    "description": "38955459",
+    "groupid": "TID"
+  },
+  "1110": {
+    "value": "1110",
+    "description": "2100778989",
+    "groupid": "MID"
+  },
+  "12": {
+    "value": "'1ZTMGDA12'",
+    "description": "12: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1201": {
+    "value": "1201",
+    "description": "SZCZEC_1201",
+    "groupid": "AUTABB"
+  },
+  "1202": {
+    "value": "1202",
+    "description": "SZCZEC_1202",
+    "groupid": "AUTABB"
+  },
+  "1203": {
+    "value": "'3CSSPR1203'",
+    "description": "1203: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1204": {
+    "value": "1204",
+    "description": "24201564",
+    "groupid": "TID"
+  },
+  "1205": {
+    "value": "1205",
+    "description": "WROC-GL_1205",
+    "groupid": "AUTABB"
+  },
+  "1206": {
+    "value": "1206",
+    "description": "24201578",
+    "groupid": "TID"
+  },
+  "1207": {
+    "value": "'3CSSPR1207'",
+    "description": "1207: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1208": {
+    "value": "'3CSSPR1208'",
+    "description": "1208: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1209": {
+    "value": "1209",
+    "description": "24201583",
+    "groupid": "TID"
+  },
+  "1210": {
+    "value": "1210",
+    "description": "WROC-GL_1210",
+    "groupid": "AUTABB"
+  },
+  "1211": {
+    "value": "1211",
+    "description": "2100497500",
+    "groupid": "MID"
+  },
+  "1212": {
+    "value": "1212",
+    "description": "29255457",
+    "groupid": "TID"
+  },
+  "1213": {
+    "value": "'3CSSPR1213'",
+    "description": "1213: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1214": {
+    "value": "1214",
+    "description": "29259218",
+    "groupid": "TID"
+  },
+  "1215": {
+    "value": "1215",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1216": {
+    "value": "1216",
+    "description": "29259217",
+    "groupid": "TID"
+  },
+  "1217": {
+    "value": "1217",
+    "description": "24202304",
+    "groupid": "TID"
+  },
+  "1218": {
+    "value": "'10CSSPR1218'",
+    "description": "1218: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1219": {
+    "value": "1219",
+    "description": "2100453792",
+    "groupid": "MID"
+  },
+  "1220": {
+    "value": "1220",
+    "description": "K-CE_1220",
+    "groupid": "AUTABB"
+  },
+  "1221": {
+    "value": "1221",
+    "description": "29260323",
+    "groupid": "TID"
+  },
+  "1222": {
+    "value": "1222",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1223": {
+    "value": "1223",
+    "description": "1223_MALBORK",
+    "groupid": "AUTABB"
+  },
+  "1224": {
+    "value": "1224",
+    "description": "24234866",
+    "groupid": "TID"
+  },
+  "1225": {
+    "value": "1225",
+    "description": "24236382",
+    "groupid": "TID"
+  },
+  "1226": {
+    "value": "1226",
+    "description": "1226_TARNOW",
+    "groupid": "AUTABB"
+  },
+  "1227": {
+    "value": "1227",
+    "description": "24234867",
+    "groupid": "TID"
+  },
+  "1228": {
+    "value": "1228",
+    "description": "24209755",
+    "groupid": "TID"
+  },
+  "1229": {
+    "value": "1229",
+    "description": "24210515",
+    "groupid": "TID"
+  },
+  "1230": {
+    "value": "1230",
+    "description": "TARNOW_1230",
+    "groupid": "AUTABB"
+  },
+  "1231": {
+    "value": "1231",
+    "description": "24210909",
+    "groupid": "TID"
+  },
+  "1232": {
+    "value": "1232",
+    "description": "2100779098",
+    "groupid": "MID"
+  },
+  "1233": {
+    "value": "1233",
+    "description": "ZAWIERC_1233",
+    "groupid": "AUTABB"
+  },
+  "1234": {
+    "value": "1234",
+    "description": "ZAWIERC_1234",
+    "groupid": "AUTABB"
+  },
+  "1235": {
+    "value": "1235",
+    "description": "POZN-GL_1235",
+    "groupid": "AUTABB"
+  },
+  "1236": {
+    "value": "'3CSSPR1236'",
+    "description": "1236: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1237": {
+    "value": "1237",
+    "description": "24201568",
+    "groupid": "TID"
+  },
+  "1238": {
+    "value": "1238",
+    "description": "POZN-GL_1238",
+    "groupid": "AUTABB"
+  },
+  "1239": {
+    "value": "1239",
+    "description": "2100453778",
+    "groupid": "MID"
+  },
+  "1240": {
+    "value": "1240",
+    "description": "POZN-GL_1240",
+    "groupid": "AUTABB"
+  },
+  "1241": {
+    "value": "1241",
+    "description": "24201628",
+    "groupid": "TID"
+  },
+  "1242": {
+    "value": "1242",
+    "description": "24201551",
+    "groupid": "TID"
+  },
+  "1243": {
+    "value": "1243",
+    "description": "2100982067",
+    "groupid": "MID"
+  },
+  "1244": {
+    "value": "1244",
+    "description": "2100453749",
+    "groupid": "MID"
+  },
+  "1245": {
+    "value": "1245",
+    "description": "2100779168",
+    "groupid": "MID"
+  },
+  "1246": {
+    "value": "1246",
+    "description": "OSTROW_1246",
+    "groupid": "AUTABB"
+  },
+  "1247": {
+    "value": "1247",
+    "description": "24201571",
+    "groupid": "TID"
+  },
+  "1248": {
+    "value": "1248",
+    "description": "2100778978",
+    "groupid": "MID"
+  },
+  "1249": {
+    "value": "1249",
+    "description": "WLOC-ZA_1249",
+    "groupid": "AUTABB"
+  },
+  "1250": {
+    "value": "1250",
+    "description": "2100779015",
+    "groupid": "MID"
+  },
+  "1251": {
+    "value": "1251",
+    "description": "2100453761",
+    "groupid": "MID"
+  },
+  "1252": {
+    "value": "'3CSSPR1252'",
+    "description": "1252: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1253": {
+    "value": "'3CSSPR1253'",
+    "description": "1253: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1254": {
+    "value": "1254",
+    "description": "2100459137",
+    "groupid": "MID"
+  },
+  "1255": {
+    "value": "1255",
+    "description": "2100778877",
+    "groupid": "MID"
+  },
+  "1256": {
+    "value": "'3CSSPR1256'",
+    "description": "1256: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1257": {
+    "value": "1257",
+    "description": "24201634",
+    "groupid": "TID"
+  },
+  "1258": {
+    "value": "1258",
+    "description": "CZEST_1258",
+    "groupid": "AUTABB"
+  },
+  "1259": {
+    "value": "1259",
+    "description": "CZEST_1259",
+    "groupid": "AUTABB"
+  },
+  "1260": {
+    "value": "1260",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1261": {
+    "value": "1261",
+    "description": "24201560",
+    "groupid": "TID"
+  },
+  "1262": {
+    "value": "1262",
+    "description": "KRAK_GN_1262",
+    "groupid": "AUTABB"
+  },
+  "1263": {
+    "value": "1263",
+    "description": "24202303",
+    "groupid": "TID"
+  },
+  "1264": {
+    "value": "1264",
+    "description": "24201545",
+    "groupid": "TID"
+  },
+  "1265": {
+    "value": "1265",
+    "description": "24201567",
+    "groupid": "TID"
+  },
+  "1266": {
+    "value": "1266",
+    "description": "24202095",
+    "groupid": "TID"
+  },
+  "1267": {
+    "value": "1267",
+    "description": "2100497479",
+    "groupid": "MID"
+  },
+  "1268": {
+    "value": "1268",
+    "description": "24201596",
+    "groupid": "TID"
+  },
+  "1269": {
+    "value": "1269",
+    "description": "2100513261",
+    "groupid": "MID"
+  },
+  "1270": {
+    "value": "'3CSSPR1270'",
+    "description": "1270: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1271": {
+    "value": "1271",
+    "description": "BYDG_GL_1271",
+    "groupid": "AUTABB"
+  },
+  "1272": {
+    "value": "1272",
+    "description": "2100513266",
+    "groupid": "MID"
+  },
+  "1273": {
+    "value": "1273",
+    "description": "WLAD_1273",
+    "groupid": "AUTABB"
+  },
+  "1274": {
+    "value": "'3CSSPR1274'",
+    "description": "1274: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1275": {
+    "value": "1275",
+    "description": "2100453804",
+    "groupid": "MID"
+  },
+  "1276": {
+    "value": "1276",
+    "description": "WRZESN_1276",
+    "groupid": "AUTABB"
+  },
+  "1277": {
+    "value": "'3CSSPR1277'",
+    "description": "1277: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1278": {
+    "value": "1278",
+    "description": "29255458",
+    "groupid": "TID"
+  },
+  "1279": {
+    "value": "1279",
+    "description": "GDA_GL_1279",
+    "groupid": "AUTABB"
+  },
+  "1280": {
+    "value": "1280",
+    "description": "24224302",
+    "groupid": "TID"
+  },
+  "1281": {
+    "value": "1281",
+    "description": "24224305",
+    "groupid": "TID"
+  },
+  "1282": {
+    "value": "1282",
+    "description": "24224299",
+    "groupid": "TID"
+  },
+  "1283": {
+    "value": "1283",
+    "description": "24224304",
+    "groupid": "TID"
+  },
+  "1284": {
+    "value": "1284",
+    "description": "24224297",
+    "groupid": "TID"
+  },
+  "1285": {
+    "value": "1285",
+    "description": "2101340840",
+    "groupid": "MID"
+  },
+  "1286": {
+    "value": "1286",
+    "description": "2100453745",
+    "groupid": "MID"
+  },
+  "1287": {
+    "value": "1287",
+    "description": "2100779050",
+    "groupid": "MID"
+  },
+  "1288": {
+    "value": "1288",
+    "description": "2100779043",
+    "groupid": "MID"
+  },
+  "1289": {
+    "value": "1289",
+    "description": "24201546",
+    "groupid": "TID"
+  },
+  "1290": {
+    "value": "1290",
+    "description": "SZCZEC_1290",
+    "groupid": "AUTABB"
+  },
+  "1291": {
+    "value": "1291",
+    "description": "1291_ELBLĄG",
+    "groupid": "AUTABB"
+  },
+  "1292": {
+    "value": "1292",
+    "description": "1292_LĘBORK",
+    "groupid": "AUTABB"
+  },
+  "1293": {
+    "value": "1293",
+    "description": "24201563",
+    "groupid": "TID"
+  },
+  "1294": {
+    "value": "1294",
+    "description": "2100453766",
+    "groupid": "MID"
+  },
+  "1295": {
+    "value": "1295",
+    "description": "2100453774",
+    "groupid": "MID"
+  },
+  "1296": {
+    "value": "1296",
+    "description": "24201581",
+    "groupid": "TID"
+  },
+  "1297": {
+    "value": "1297",
+    "description": "2100453779",
+    "groupid": "MID"
+  },
+  "1298": {
+    "value": "1298",
+    "description": "SZCZEC_1298",
+    "groupid": "AUTABB"
+  },
+  "1299": {
+    "value": "'3CSSPR1299'",
+    "description": "1299: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "13": {
+    "value": "'1ZTMGDA13'",
+    "description": "13: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1301": {
+    "value": "1301",
+    "description": "2101338978",
+    "groupid": "MID"
+  },
+  "1302": {
+    "value": "1302",
+    "description": "2101340837",
+    "groupid": "MID"
+  },
+  "1303": {
+    "value": "1303",
+    "description": "2101340838",
+    "groupid": "MID"
+  },
+  "1304": {
+    "value": "1304",
+    "description": "2101340844",
+    "groupid": "MID"
+  },
+  "1305": {
+    "value": "1305",
+    "description": "2101340848",
+    "groupid": "MID"
+  },
+  "1311": {
+    "value": "1311",
+    "description": "24224294",
+    "groupid": "TID"
+  },
+  "1312": {
+    "value": "1312",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1313": {
+    "value": "1313",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1314": {
+    "value": "1314",
+    "description": "2101340847",
+    "groupid": "MID"
+  },
+  "1315": {
+    "value": "1315",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1316": {
+    "value": "1316",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1317": {
+    "value": "1317",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1318": {
+    "value": "1318",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1319": {
+    "value": "1319",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1320": {
+    "value": "1320",
+    "description": "2101340856",
+    "groupid": "MID"
+  },
+  "1321": {
+    "value": "1321",
+    "description": "24224310",
+    "groupid": "TID"
+  },
+  "1322": {
+    "value": "1322",
+    "description": "2101340857",
+    "groupid": "MID"
+  },
+  "1323": {
+    "value": "1323",
+    "description": "2101340860",
+    "groupid": "MID"
+  },
+  "1324": {
+    "value": "1324",
+    "description": "24224311",
+    "groupid": "TID"
+  },
+  "1325": {
+    "value": "1325",
+    "description": "24224683",
+    "groupid": "TID"
+  },
+  "1326": {
+    "value": "1326",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1327": {
+    "value": "1327",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1328": {
+    "value": "1328",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1329": {
+    "value": "1329",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1330": {
+    "value": "1330",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1331": {
+    "value": "1331",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1332": {
+    "value": "1332",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "14": {
+    "value": "'1ZTMGDA14'",
+    "description": "14: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1411": {
+    "value": "'5CSSPR1411'",
+    "description": "1411: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1412": {
+    "value": "'5CSSPR1412'",
+    "description": "1412: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1413": {
+    "value": "'5CSSPR1413'",
+    "description": "1413: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1414": {
+    "value": "'5CSSPR1414'",
+    "description": "1414: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1415": {
+    "value": "'5CSSPR1415'",
+    "description": "1415: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1416": {
+    "value": "'5CSSPR1416'",
+    "description": "1416: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1417": {
+    "value": "'5CSSPR1417'",
+    "description": "1417: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1418": {
+    "value": "'5CSSPR1418'",
+    "description": "1418: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1419": {
+    "value": "'5CSSPR1419'",
+    "description": "1419: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1420": {
+    "value": "'5CSSPR1420'",
+    "description": "1420: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1421": {
+    "value": "'5CSSPR1421'",
+    "description": "1421: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1422": {
+    "value": "'5CSSPR1422'",
+    "description": "1422: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1423": {
+    "value": "'5CSSPR1423'",
+    "description": "1423: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1424": {
+    "value": "'5CSSPR1424'",
+    "description": "1424: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "15": {
+    "value": "'1ZTMGDA15'",
+    "description": "15: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1560": {
+    "value": "1560",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1561": {
+    "value": "'5CSSPR1561'",
+    "description": "1561: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1562": {
+    "value": "'5CSSPR1562'",
+    "description": "1562: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1563": {
+    "value": "'5CSSPR1563'",
+    "description": "1563: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1564": {
+    "value": "'5CSSPR1564'",
+    "description": "1564: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1565": {
+    "value": "1565",
+    "description": "0",
+    "groupid": "TID"
+  },
+  "1566": {
+    "value": "1566",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1567": {
+    "value": "'5CSSPR1567'",
+    "description": "1567: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1568": {
+    "value": "1568",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "1569": {
+    "value": "1569",
+    "description": "0",
+    "groupid": "MID"
+  },
+  "16": {
+    "value": "'1ZTMGDA16'",
+    "description": "16: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "17": {
+    "value": "'1ZTMGDA17'",
+    "description": "17: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "1730": {
+    "value": "1730",
+    "description": "2101427267",
+    "groupid": "MID"
+  },
+  "1731": {
+    "value": "1731",
+    "description": "2101427274",
+    "groupid": "MID"
+  },
+  "1732": {
+    "value": "1732",
+    "description": "24237874",
+    "groupid": "TID"
+  },
+  "1733": {
+    "value": "1733",
+    "description": "2101427277",
+    "groupid": "MID"
+  },
+  "1734": {
+    "value": "1734",
+    "description": "24237845",
+    "groupid": "TID"
+  },
+  "1735": {
+    "value": "1735",
+    "description": "2101427262",
+    "groupid": "MID"
+  },
+  "1736": {
+    "value": "1736",
+    "description": "24237842",
+    "groupid": "TID"
+  },
+  "1737": {
+    "value": "1737",
+    "description": "2101427269",
+    "groupid": "MID"
+  },
+  "1738": {
+    "value": "1738",
+    "description": "24237850",
+    "groupid": "TID"
+  },
+  "1739": {
+    "value": "1739",
+    "description": "24237844",
+    "groupid": "TID"
+  },
+  "1740": {
+    "value": "1740",
+    "description": "24237718",
+    "groupid": "TID"
+  },
+  "1741": {
+    "value": "1741",
+    "description": "24237881",
+    "groupid": "TID"
+  },
+  "1742": {
+    "value": "1742",
+    "description": "24237886",
+    "groupid": "TID"
+  },
+  "1743": {
+    "value": "1743",
+    "description": "2101427284",
+    "groupid": "MID"
+  },
+  "1744": {
+    "value": "1744",
+    "description": "24237883",
+    "groupid": "TID"
+  },
+  "18": {
+    "value": "'1ZTMGDA18'",
+    "description": "18: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "19": {
+    "value": "'1ZTMGDA19'",
+    "description": "19: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "197001010000": {
+    "value": "PR",
+    "description": "SZCZEC_1202",
+    "groupid": "OBS1202"
+  },
+  "2": {
+    "value": "'1ZTMGDA2'",
+    "description": "2: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "20": {
+    "value": "'1ZTMGDA20'",
+    "description": "20: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "201210290000": {
+    "value": "PO",
+    "description": "K-CE_1216",
+    "groupid": "OBS1216"
+  },
+  "201212060000": {
+    "value": "PO",
+    "description": "K-CE_1213",
+    "groupid": "OBS1213"
+  },
+  "201212210000": {
+    "value": "PO",
+    "description": "B-B-GL_1224",
+    "groupid": "OBS1224"
+  },
+  "201303010000": {
+    "value": "PO",
+    "description": "SZCZEC_1298",
+    "groupid": "OBS1298"
+  },
+  "201303120000": {
+    "value": "PO",
+    "description": "TOR-GL_1247",
+    "groupid": "OBS1247"
+  },
+  "201303130000": {
+    "value": "PO",
+    "description": "BYDG_GL_1271",
+    "groupid": "OBS1271"
+  },
+  "201303200000": {
+    "value": "PO",
+    "description": "KRAK_GL_1268",
+    "groupid": "OBS1268"
+  },
+  "201304040000": {
+    "value": "PO",
+    "description": "KEDZ-KO_1288",
+    "groupid": "OBS1288"
+  },
+  "201304080000": {
+    "value": "PO",
+    "description": "LESZNO_1266",
+    "groupid": "OBS1266"
+  },
+  "201304090000": {
+    "value": "PO",
+    "description": "OSTROW_1245",
+    "groupid": "OBS1245"
+  },
+  "201304150000": {
+    "value": "PO",
+    "description": "OPO-GL_1253",
+    "groupid": "OBS1253"
+  },
+  "201304240000": {
+    "value": "PO",
+    "description": "WROC-GL_1210",
+    "groupid": "OBS1210"
+  },
+  "201305310000": {
+    "value": "PO",
+    "description": "SZCZEC_1290",
+    "groupid": "OBS1290"
+  },
+  "201402281200": {
+    "value": "PO",
+    "description": "KONIN_1241",
+    "groupid": "OBS1241"
+  },
+  "201501150000": {
+    "value": "PO",
+    "description": "GNIEZNO_1244",
+    "groupid": "OBS1244"
+  },
+  "201501270000": {
+    "value": "PO",
+    "description": "POZN-GL_1296",
+    "groupid": "OBS1296"
+  },
+  "201501280000": {
+    "value": "PO",
+    "description": "POZN-GL_1239",
+    "groupid": "OBS1239"
+  },
+  "21": {
+    "value": "'1ZTMGDA21'",
+    "description": "21: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "22": {
+    "value": "'1ZTMGDA22'",
+    "description": "22: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "23": {
+    "value": "'1ZTMGDA23'",
+    "description": "23: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "24": {
+    "value": "'1ZTMGDA24'",
+    "description": "24: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "25": {
+    "value": "'1ZTMGDA25'",
+    "description": "25: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "26": {
+    "value": "'1ZTMGDA26'",
+    "description": "26: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "27": {
+    "value": "'1ZTMGDA27'",
+    "description": "27: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "28": {
+    "value": "'1ZTMGDA28'",
+    "description": "28: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "29": {
+    "value": "'1ZTMGDA29'",
+    "description": "29: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "3": {
+    "value": "'1ZTMGDA3'",
+    "description": "3: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "30": {
+    "value": "'1ZTMGDA30'",
+    "description": "30: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "31": {
+    "value": "'1ZTMGDA31'",
+    "description": "31: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "32": {
+    "value": "'1ZTMGDA32'",
+    "description": "32: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "33": {
+    "value": "'1ZTMGDA33'",
+    "description": "33: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "34": {
+    "value": "'1ZTMGDA34'",
+    "description": "34: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "35": {
+    "value": "'1ZTMGDA35'",
+    "description": "35: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "36": {
+    "value": "'1ZTMGDA36'",
+    "description": "36: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "37": {
+    "value": "'1ZTMGDA37'",
+    "description": "37: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "38": {
+    "value": "'1ZTMGDA38'",
+    "description": "38: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "39": {
+    "value": "'1ZTMGDA39'",
+    "description": "39: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "4": {
+    "value": "'1ZTMGDA4'",
+    "description": "4: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "40": {
+    "value": "'1ZTMGDA40'",
+    "description": "40: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "41": {
+    "value": "'1ZTMGDA41'",
+    "description": "41: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "42": {
+    "value": "'1ZTMGDA42'",
+    "description": "42: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "43": {
+    "value": "'1ZTMGDA43'",
+    "description": "43: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "44": {
+    "value": "'1ZTMGDA44'",
+    "description": "44: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "45": {
+    "value": "'1ZTMGDA45'",
+    "description": "45: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "46": {
+    "value": "'1ZTMGDA46'",
+    "description": "46: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "47": {
+    "value": "'1ZTMGDA47'",
+    "description": "47: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "48": {
+    "value": "'1ZTMGDA48'",
+    "description": "48: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "49": {
+    "value": "'1ZTMGDA49'",
+    "description": "49: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "5": {
+    "value": "'1ZTMGDA5'",
+    "description": "5: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "50": {
+    "value": "'1ZTMGDA50'",
+    "description": "50: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "51": {
+    "value": "'1ZTMGDA51'",
+    "description": "51: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "6": {
+    "value": "'1ZTMGDA6'",
+    "description": "6: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "7": {
+    "value": "'1ZTMGDA7'",
+    "description": "7: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "8": {
+    "value": "'1ZTMGDA8'",
+    "description": "8: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "9": {
+    "value": "'1ZTMGDA9'",
+    "description": "9: Opis",
+    "groupid": "ABBBLIK"
+  },
+  "9999": {
+    "value": "'3CSSPR9999'",
+    "description": "9999: Opis",
+    "groupid": "ABBBLIK"
+  }
+}
