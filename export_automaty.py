@@ -1,5 +1,6 @@
-# export_automaty.py - Miesięczne zestawienie TVM P&L (ETAP 1: kolumny 1-INFO, 2-OBRÓT)
+# export_automaty.py - Miesięczne zestawienie TVM P&L (ETAP 1: kolumny 1-INFO, 2-OBRÓT, 3-PROWIZJA)
 import psycopg2
+from psycopg2 import sql
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
@@ -8,6 +9,7 @@ import json
 import argparse
 import time
 from pathlib import Path
+import re
 
 # === KONFIGURACJA ===
 DB_CONFIG = {
@@ -15,13 +17,70 @@ DB_CONFIG = {
     'port': 5432,
     'database': 'postgres',  # Zmienione - będzie automatycznie wykrywana właściwa baza
     'user': 'sprzedaz',
-    'password': 'tVregNm5'
+    'password': 'tVregNm5',
+    'sslmode': 'prefer'
 }
 
-# Schemat AV zawiera wszystkie dane (moneystats, dictionary, aggregators, summaries)
-SCHEMA_AV = 'AV'
+# Schemat ARP zawiera wszystkie dane (moneystats, dictionary, aggregators, summaries)
+SCHEMA = 'ARP'
 SNAPSHOT_DIR = Path(__file__).parent / 'snapshots'
 OUTPUT_DIR = Path(__file__).parent / 'output'
+DEVICE_ID_RANGES = (
+    (1101, 1141),
+    (1201, 1299),
+)
+
+# Konfiguracja źródła prowizji - można nadpisać parametrami CLI
+COMMISSION_SOURCE_CONFIG = {
+    'schema': 'public',
+    'table': 'provision',
+    'device_col': 'tvm_id_prov',
+    'amount_col': 'provision_prov',
+    'date_col': 'valid_from',
+    'date_to_col': 'valid_to',
+    'provider_col': None,
+    'provider_values': None
+}
+
+
+def _build_device_filter_sql(column_sql):
+    """
+    Buduje warunek SQL filtrujący urządzenia wg ustalonych zakresów ID.
+    """
+    clauses = []
+    for start_id, end_id in DEVICE_ID_RANGES:
+        clauses.append(
+            sql.SQL("({column} BETWEEN {start_id} AND {end_id})").format(
+                column=column_sql,
+                start_id=sql.Literal(start_id),
+                end_id=sql.Literal(end_id),
+            )
+        )
+    return sql.SQL("(") + sql.SQL(" OR ").join(clauses) + sql.SQL(")")
+
+
+def extract_city_name(description):
+    """
+    Wyciąga nazwę miasta z pola description, usuwając numery automatów.
+    Przykłady:
+      'WROC-GL_1204'  -> 'WROC-GL'
+      '1214_RZEPIN'   -> 'RZEPIN'
+      'KRAK_GN_1263'  -> 'KRAK-GN'
+      '2100779032'    -> ''  (czysto numeryczne)
+      '1203: Opis'    -> ''  (placeholder)
+    """
+    if not description:
+        return ''
+    normalized = str(description).strip()
+    if 'opis' in normalized.lower():
+        return ''
+
+    parts = normalized.split('_')
+    letter_parts = [p for p in parts if re.search(r'[A-Za-z]', p)]
+    result = '-'.join(letter_parts)
+    if result in ('Opis', 'opis', ''):
+        return ''
+    return result
 
 
 # === FUNKCJE POMOCNICZE: DIAGNOSTYKA BAZY DANYCH ===
@@ -37,6 +96,7 @@ def list_available_databases(host, port, user, password):
             database='postgres',  # Domyślna baza systemowa
             user=user,
             password=password,
+            sslmode=DB_CONFIG.get('sslmode', 'prefer'),
             connect_timeout=10
         )
         cursor = conn.cursor()
@@ -96,6 +156,7 @@ def connect_to_db(database_name=None, max_retries=3, retry_delay=5):
                 database=database_name,
                 user=DB_CONFIG['user'],
                 password=DB_CONFIG['password'],
+                sslmode=DB_CONFIG.get('sslmode', 'prefer'),
                 connect_timeout=10
             )
             if attempt > 1:
@@ -112,34 +173,37 @@ def connect_to_db(database_name=None, max_retries=3, retry_delay=5):
     return None
 
 
-# === 1-INFO: SŁOWNIK AUTOMATÓW (AV.dictionary) ===
+# === 1-INFO: SŁOWNIK AUTOMATÓW (ARP.dictionary) ===
 
 def get_dictionary_snapshot(conn):
     """
-    Pobiera słownik automatów z AV.dictionary.
-    Zwraca: dict {device_id: {value, description, groupid}}
-    Filtruje tylko rzeczywiste ID automatów (numeric) lub w zakresie 1101-1299.
+    Pobiera słownik automatów z ARP.dictionary.
+    Zwraca: dict {device_id: {'description': description}}
+    Filtruje tylko rzeczywiste ID automatów (numeric) z zakresów:
+    1101-1141 oraz 1201-1299.
     """
     cursor = conn.cursor()
-    query = """
-    SELECT id, value, description, groupid
-    FROM "AV".dictionary
-    WHERE id::text ~ '^[0-9]+$'
-    ORDER BY id
-    """
+    query = sql.SQL(
+        """
+                SELECT id, description
+                FROM {schema}.dictionary
+                WHERE id::text ~ '^[0-9]+$'
+                    AND {device_filter}
+                ORDER BY id
+                """
+        ).format(
+            schema=sql.Identifier(SCHEMA),
+            device_filter=_build_device_filter_sql(sql.SQL("id::bigint")),
+        )
     cursor.execute(query)
     rows = cursor.fetchall()
     cursor.close()
     
     snapshot = {}
     for row in rows:
-        device_id, value, description, groupid = row
-        # Konwertuj id do integer dla konsekwencji
-        device_id_int = int(device_id)
-        snapshot[device_id_int] = {
-            'value': value,
+        device_id, description = row
+        snapshot[int(device_id)] = {
             'description': description,
-            'groupid': groupid
         }
     
     return snapshot
@@ -204,37 +268,234 @@ def compare_snapshots(current, previous):
 
 # === 2-OBRÓT: DANE Z MONEYSTATS ZA MIESIĄC ===
 
-def get_monthly_revenue(conn, month_str):
+def get_month_range(month_str):
     """
-    Pobiera obrót brutto per automat za dany miesiąc z tabeli AV.moneystats.
+    Zwraca zakres dat dla miesiąca raportowego.
     month_str: 'YYYY-MM'
-    Zwraca: dict {device_id: {'obrot_brutto_zl': float, 'liczba_transakcji': int}}
     """
     year, month = map(int, month_str.split('-'))
     start_date = datetime(year, month, 1)
-    # Koniec miesiąca = początek następnego miesiąca
     end_date = start_date + relativedelta(months=1)
-    
-    start_str = start_date.strftime('%Y-%m-%d %H:%M:%S')
-    end_str = end_date.strftime('%Y-%m-%d %H:%M:%S')
-    
+    return start_date, end_date
+
+
+def _pick_first_matching_column(columns, candidates):
+    """
+    Zwraca pierwszą kolumnę pasującą do listy kandydatów.
+    Porównanie jest case-insensitive.
+    """
+    lowered = {c.lower(): c for c in columns}
+    for candidate in candidates:
+        if candidate.lower() in lowered:
+            return lowered[candidate.lower()]
+    return None
+
+
+def discover_commission_source(conn, schema=SCHEMA):
+    """
+    Próbuje automatycznie znaleźć tabelę i kolumny prowizji w schema ARP.
+    Zwraca dict ze źródłem lub None.
+    """
     cursor = conn.cursor()
-    
-    # Pobierz dane z AV.moneystats
-    query = f"""
-        SELECT 
+    cursor.execute(
+        """
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s
+        ORDER BY table_name, ordinal_position
+        """,
+        (schema,)
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        return None
+
+    tables = {}
+    for table_name, column_name in rows:
+        tables.setdefault(table_name, []).append(column_name)
+
+    device_candidates = [
+        'device_id', 'deviceid', 'ms_deviceid', 'id_automatu', 'nr_automatu', 'automat_id'
+    ]
+    amount_candidates = [
+        'commission', 'prowizja', 'prowizja_zl', 'fee', 'interchange',
+        'elavon_fee', 'amount', 'kwota', 'kwota_prowizji'
+    ]
+    date_candidates = [
+        'create_date', 'createdate', 'ms_creadate', 'data', 'date',
+        'transaction_date', 'settlement_date'
+    ]
+    provider_candidates = [
+        'provider', 'operator', 'aggregator', 'source', 'payment_operator'
+    ]
+    table_name_hints = ['prowiz', 'commission', 'interchange', 'elavon', 'summary', 'settlement']
+
+    best_source = None
+    best_score = -1
+
+    for table_name, columns in tables.items():
+        device_col = _pick_first_matching_column(columns, device_candidates)
+        amount_col = _pick_first_matching_column(columns, amount_candidates)
+        date_col = _pick_first_matching_column(columns, date_candidates)
+        provider_col = _pick_first_matching_column(columns, provider_candidates)
+
+        if not all([device_col, amount_col, date_col]):
+            continue
+
+        score = 0
+        lowered_table = table_name.lower()
+        score += sum(2 for token in table_name_hints if token in lowered_table)
+        score += 3  # komplet kluczowych kolumn
+        if provider_col:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_source = {
+                'schema': schema,
+                'table': table_name,
+                'device_col': device_col,
+                'amount_col': amount_col,
+                'date_col': date_col,
+                'provider_col': provider_col,
+                'provider_values': None
+            }
+
+    return best_source
+
+
+def get_monthly_commission(conn, month_str, source_config=None):
+    """
+    Pobiera prowizję per automat za dany miesiąc.
+    Zwraca: dict {device_id: {'prowizja_zl': float, 'liczba_rekordow': int}}
+    """
+    start_date, end_date = get_month_range(month_str)
+
+    if source_config is None:
+        source_config = COMMISSION_SOURCE_CONFIG
+
+    source = dict(source_config)
+    has_explicit_mapping = all([
+        source.get('table'),
+        source.get('device_col'),
+        source.get('amount_col'),
+        source.get('date_col')
+    ])
+
+    if not has_explicit_mapping:
+        discovered = discover_commission_source(conn, schema=source.get('schema', SCHEMA))
+        if discovered is None:
+            print("⚠ Nie znaleziono źródła prowizji - kolumna 3-PROWIZJA pozostanie pusta")
+            return {}
+        source.update(discovered)
+        print(
+            "✓ Auto-detekcja prowizji: "
+            f"{source['schema']}.{source['table']} "
+            f"(device={source['device_col']}, amount={source['amount_col']}, date={source['date_col']})"
+        )
+
+    provider_col = source.get('provider_col')
+    provider_values = source.get('provider_values')
+    date_to_col = source.get('date_to_col')
+
+    params = [start_date, end_date]
+    time_filter_sql = sql.SQL("{date_col} >= %s AND {date_col} < %s").format(
+        date_col=sql.Identifier(source['date_col'])
+    )
+    if date_to_col:
+        params = [end_date, start_date]
+        time_filter_sql = sql.SQL(
+            "{date_from} < %s AND ({date_to} IS NULL OR {date_to} >= %s)"
+        ).format(
+            date_from=sql.Identifier(source['date_col']),
+            date_to=sql.Identifier(date_to_col)
+        )
+
+    provider_filter_sql = sql.SQL('')
+    if provider_col and provider_values:
+        placeholders = sql.SQL(', ').join([sql.Placeholder()] * len(provider_values))
+        provider_filter_sql = sql.SQL(" AND UPPER(COALESCE({provider_col}::text, '')) IN ({vals})").format(
+            provider_col=sql.Identifier(provider_col),
+            vals=placeholders
+        )
+        params.extend([v.upper() for v in provider_values])
+
+    query = sql.SQL(
+        """
+        SELECT
+            {device_col} AS device_id,
+            SUM(COALESCE({amount_col}, 0)) AS prowizja_zl,
+            COUNT(*) AS liczba_rekordow
+        FROM {schema}.{table}
+        WHERE {time_filter}
+          AND {device_filter}
+          {provider_filter}
+        GROUP BY {device_col}
+        ORDER BY device_id
+        """
+    ).format(
+        schema=sql.Identifier(source.get('schema', SCHEMA)),
+        table=sql.Identifier(source['table']),
+        device_col=sql.Identifier(source['device_col']),
+        amount_col=sql.Identifier(source['amount_col']),
+        time_filter=time_filter_sql,
+        device_filter=_build_device_filter_sql(sql.Identifier(source['device_col'])),
+        provider_filter=provider_filter_sql
+    )
+
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, tuple(params))
+        rows = cursor.fetchall()
+    except psycopg2.Error as e:
+        print(f"⚠ Błąd pobierania prowizji: {e}")
+        rows = []
+    finally:
+        cursor.close()
+
+    commission_data = {}
+    for row in rows:
+        device_id, prowizja, liczba_rekordow = row
+        commission_data[int(device_id)] = {
+            'prowizja_zl': float(prowizja or 0),
+            'liczba_rekordow': int(liczba_rekordow)
+        }
+
+    return commission_data
+
+
+def get_monthly_revenue(conn, month_str):
+    """
+    Pobiera obrót brutto per automat za dany miesiąc z tabeli ARP.moneystats.
+    month_str: 'YYYY-MM'
+    Zwraca: dict {device_id: {'obrot_brutto_zl': float, 'liczba_transakcji': int}}
+    """
+    start_date, end_date = get_month_range(month_str)
+
+    cursor = conn.cursor()
+
+    # Pobierz dane z ARP.moneystats
+    query = sql.SQL(
+        """
+        SELECT
             ms_deviceid AS device_id,
             SUM(COALESCE(ms_vtotal, 0)) AS obrot_brutto_zl,
             COUNT(*) AS liczba_transakcji
-        FROM "{SCHEMA_AV}".moneystats
-        WHERE ms_creadate >= '{start_str}'
-          AND ms_creadate < '{end_str}'
-          AND ms_deviceid BETWEEN 1101 AND 1299
+        FROM {schema}.moneystats
+        WHERE ms_creadate >= %s
+          AND ms_creadate < %s
+          AND {device_filter}
         GROUP BY ms_deviceid
         ORDER BY device_id
-    """
-    
-    cursor.execute(query)
+        """
+    ).format(
+        schema=sql.Identifier(SCHEMA),
+        device_filter=_build_device_filter_sql(sql.Identifier('ms_deviceid')),
+    )
+
+    cursor.execute(query, (start_date, end_date))
     rows = cursor.fetchall()
     cursor.close()
     
@@ -252,14 +513,18 @@ def get_monthly_revenue(conn, month_str):
 
 # === EKSPORT DO EXCEL (KOLUMNY 1-2, RESZTA PLACEHOLDER) ===
 
-def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename):
+def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=None):
     """
     Eksportuje raport P&L do Excela.
     Kolumny:
-    1-INFO: nr_automatu, value, description, groupid, status_zmiany
-    2-OBRÓT: obrot_brutto_zl, liczba_transakcji, przewoznik
-    3-8: placeholder (do ETAPU 2 i 3)
+    1-INFO: nr_automatu, lokalizacja, status_zmiany
+    2-OBRÓT: obrot_brutto_zl, liczba_transakcji
+    3-PROWIZJA: prowizja_zl
+    5,7,8: placeholder (do ETAPU 2 i 3)
     """
+    if commission_data is None:
+        commission_data = {}
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filepath = OUTPUT_DIR / filename
     
@@ -270,17 +535,13 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename)
     # === NAGŁÓWKI ===
     headers = [
         # 1-INFO
-        'Nr automatu', 'Value', 'Description', 'GroupID', 'Status', 'Przewoźnik',
+        'Nr automatu', 'Lokalizacja', 'Status',
         # 2-OBRÓT
         'Obrót brutto (zł)', 'Liczba transakcji',
-        # 3-PROWIZJA (placeholder)
+        # 3-PROWIZJA
         'Prowizja (zł)',
-        # 4-RODZAJ TRANZAKCJI (placeholder)
-        'Rodzaj transakcji',
         # 5-KOSZTY (placeholder)
         'Koszty (zł)',
-        # 6-PO SUMIE (placeholder)
-        'Wynik netto (zł)',
         # 7-PODSUMOWANIE ROCZNE (placeholder)
         'Suma roczna',
         # 8-UWAGI (placeholder)
@@ -308,11 +569,9 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename)
             info = dictionary_comparison[device_id]
             status = info['status']
             data = info['data']
-            value = data.get('value', '')
-            description = data.get('description', '')
-            groupid = data.get('groupid', '')
+            lokalizacja = extract_city_name(data.get('description', ''))
         else:
-            value = description = groupid = ''
+            lokalizacja = ''
             status = 'brak w dict'
         
         # 2-OBRÓT
@@ -320,36 +579,34 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename)
             rev = revenue_data[device_id]
             obrot = rev['obrot_brutto_zl']
             liczba = rev['liczba_transakcji']
-            przewoznik = ''  # TODO: Pobrać z tabeli aggregators
         else:
             obrot = 0.0
             liczba = 0
-            przewoznik = ''
         
-        # Placeholder dla kolumn 3-8
-        prowizja = ''
-        rodzaj = ''
+        # 3-PROWIZJA
+        if device_id in commission_data:
+            prowizja = commission_data[device_id].get('prowizja_zl', 0.0)
+        else:
+            prowizja = ''
+
+        # Placeholder dla kolumn 5,7,8
         koszty = ''
-        wynik_netto = ''
         suma_roczna = ''
         uwagi = ''
         
         # Wpisz dane do wiersza
         ws.cell(row=row_num, column=1).value = device_id
-        ws.cell(row=row_num, column=2).value = value
-        ws.cell(row=row_num, column=3).value = description
-        ws.cell(row=row_num, column=4).value = groupid
-        ws.cell(row=row_num, column=5).value = status
-        ws.cell(row=row_num, column=6).value = przewoznik
-        ws.cell(row=row_num, column=7).value = obrot
-        ws.cell(row=row_num, column=7).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=8).value = liczba
-        ws.cell(row=row_num, column=9).value = prowizja
-        ws.cell(row=row_num, column=10).value = rodzaj
-        ws.cell(row=row_num, column=11).value = koszty
-        ws.cell(row=row_num, column=12).value = wynik_netto
-        ws.cell(row=row_num, column=13).value = suma_roczna
-        ws.cell(row=row_num, column=14).value = uwagi
+        ws.cell(row=row_num, column=2).value = lokalizacja
+        ws.cell(row=row_num, column=3).value = status
+        ws.cell(row=row_num, column=4).value = obrot
+        ws.cell(row=row_num, column=4).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=5).value = liczba
+        ws.cell(row=row_num, column=6).value = prowizja
+        if isinstance(prowizja, (int, float)):
+            ws.cell(row=row_num, column=6).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=7).value = koszty
+        ws.cell(row=row_num, column=8).value = suma_roczna
+        ws.cell(row=row_num, column=9).value = uwagi
         
         row_num += 1
     
@@ -381,6 +638,19 @@ def main():
         help='Miesiąc raportu w formacie YYYY-MM (domyślnie: poprzedni miesiąc)',
         default=None
     )
+    parser.add_argument('--prowizja-schema', type=str, default=SCHEMA, help='Schema tabeli prowizji (domyślnie: ARP)')
+    parser.add_argument('--prowizja-table', type=str, default=None, help='Nazwa tabeli prowizji')
+    parser.add_argument('--prowizja-device-col', type=str, default=None, help='Kolumna z numerem automatu')
+    parser.add_argument('--prowizja-amount-col', type=str, default=None, help='Kolumna z kwotą prowizji')
+    parser.add_argument('--prowizja-date-col', type=str, default=None, help='Kolumna z datą operacji')
+    parser.add_argument('--prowizja-date-to-col', type=str, default=None, help='Kolumna daty końca obowiązywania (opcjonalnie)')
+    parser.add_argument('--prowizja-provider-col', type=str, default=None, help='Kolumna z operatorem płatności (np. ELAVON)')
+    parser.add_argument(
+        '--prowizja-provider-values',
+        nargs='*',
+        default=None,
+        help='Dozwolone wartości operatora płatności (np. ELAVON INTERCHANGE)'
+    )
     args = parser.parse_args()
     
     # Określ miesiąc raportowy
@@ -398,6 +668,29 @@ def main():
         prev_month = today - relativedelta(months=1)
         month_str = prev_month.strftime('%Y-%m')
     
+    explicit_commission_values = [
+        args.prowizja_table,
+        args.prowizja_device_col,
+        args.prowizja_amount_col,
+        args.prowizja_date_col
+    ]
+    commission_source = None
+    if any(explicit_commission_values):
+        if not all(explicit_commission_values):
+            print("❌ Dla jawnego mapowania prowizji podaj komplet:")
+            print("   --prowizja-table --prowizja-device-col --prowizja-amount-col --prowizja-date-col")
+            return
+        commission_source = {
+            'schema': args.prowizja_schema,
+            'table': args.prowizja_table,
+            'device_col': args.prowizja_device_col,
+            'amount_col': args.prowizja_amount_col,
+            'date_col': args.prowizja_date_col,
+            'date_to_col': args.prowizja_date_to_col,
+            'provider_col': args.prowizja_provider_col,
+            'provider_values': args.prowizja_provider_values
+        }
+
     print(f"\n{'='*60}")
     print(f"  Miesięczne zestawienie TVM P&L - {month_str}")
     print(f"{'='*60}\n")
@@ -412,13 +705,13 @@ def main():
         print(f"❌ Błąd połączenia z bazą: {e}")
         return
     
-    # === KROK 1: Słownik automatów (AV.dictionary) ===
-    print("\n[1/4] Pobieranie słownika automatów (AV.dictionary)...")
+    # === KROK 1: Słownik automatów (ARP.dictionary) ===
+    print("\n[1/5] Pobieranie słownika automatów (ARP.dictionary)...")
     current_snapshot = get_dictionary_snapshot(conn)
     print(f"✓ Pobrano {len(current_snapshot)} automatów ze słownika")
     
     # Porównaj z poprzednim miesiącem
-    print("\n[2/4] Porównanie z poprzednim miesiącem...")
+    print("\n[2/5] Porównanie z poprzednim miesiącem...")
     previous_snapshot = load_previous_snapshot(month_str)
     
     if previous_snapshot is None:
@@ -441,7 +734,7 @@ def main():
     save_snapshot(current_snapshot, month_str)
     
     # === KROK 2: Obrót miesięczny (moneystats) ===
-    print(f"\n[3/4] Pobieranie obrotu za {month_str}...")
+    print(f"\n[3/5] Pobieranie obrotu za {month_str}...")
     revenue_data = get_monthly_revenue(conn, month_str)
     print(f"✓ Pobrano dane obrotu dla {len(revenue_data)} automatów")
     
@@ -449,18 +742,25 @@ def main():
     total_transactions = sum(v['liczba_transakcji'] for v in revenue_data.values())
     print(f"  Obrót brutto: {total_revenue:,.2f} zł")
     print(f"  Liczba transakcji: {total_transactions:,}")
+
+    # === KROK 3: Prowizja miesięczna ===
+    print(f"\n[4/5] Pobieranie prowizji za {month_str}...")
+    commission_data = get_monthly_commission(conn, month_str, source_config=commission_source)
+    print(f"✓ Pobrano dane prowizji dla {len(commission_data)} automatów")
+    total_commission = sum(v['prowizja_zl'] for v in commission_data.values())
+    print(f"  Prowizja łączna: {total_commission:,.2f} zł")
     
     conn.close()
     
-    # === KROK 3: Eksport do Excel ===
-    print(f"\n[4/4] Eksport do Excel...")
+    # === KROK 4: Eksport do Excel ===
+    print(f"\n[5/5] Eksport do Excel...")
     filename = f"PL_TVM_{month_str}.xlsx"
-    export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename)
+    export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=commission_data)
     
     print(f"\n{'='*60}")
     print(f"  ✓ RAPORT ZAKOŃCZONY POMYŚLNIE")
-    print(f"  Kolumny zaimplementowane: 1-INFO, 2-OBRÓT")
-    print(f"  Do zrobienia (ETAP 2): kolumny 3-6")
+    print(f"  Kolumny zaimplementowane: 1-INFO, 2-OBRÓT, 3-PROWIZJA")
+    print(f"  Do zrobienia (ETAP 2): kolumny 4-6")
     print(f"{'='*60}\n")
 
 
