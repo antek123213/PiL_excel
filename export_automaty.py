@@ -31,12 +31,23 @@ DEVICE_ID_RANGES = (
     (1201, 1299),
 )
 
-CARRIERS = ['IC', 'PR', 'KD', 'ARP', 'KW', 'KS', 'LKA', 'SKM', 'KMŁ']
+CARRIERS = ['ARP', 'IC', 'KD', 'KM', 'KML', 'KS', 'KW', 'LKA', 'PR', 'SKM']
 TRANSACTIONS_SOURCE_CONFIG = {
     'table': 'transactions',
-    'amount_col': 'fin_ptu_kwota',
+    'amount_col': 'fin_nalezn',
     'date_col': 'fin_data_sp',
-    'device_col': None,
+    'device_col': 'tvm_tvm_id',
+}
+TRANSACTIONS_TABLE_OVERRIDES = {
+    'IC': 'transactionsns',
+}
+TRANSACTIONS_DEVICE_COL_OVERRIDES = {
+    # User-required precedence: tvm_aitomatnum first, then tvm_automatnum.
+    'IC': ['tvm_aitomatnum', 'tvm_automatnum'],
+}
+TRANSACTIONS_AMOUNT_COL_OVERRIDES = {
+    # User-required precedence: fin_cen_jedn first, then fin_cena_jedn.
+    'KM': ['fin_cen_jedn', 'fin_cena_jedn'],
 }
 TRANSACTIONS_DEVICE_COL_CANDIDATES = [
     'fin_nr_urz',
@@ -388,6 +399,18 @@ def get_month_range(month_str):
     year, month = map(int, month_str.split('-'))
     start_date = datetime(year, month, 1)
     end_date = start_date + relativedelta(months=1)
+    return start_date, end_date
+
+
+def get_month_range_closed(month_str):
+    """
+    Zwraca domknięty zakres dat dla miesiąca raportowego:
+    od 1 dnia 00:00:00 do ostatniego dnia 23:59:59.
+    """
+    start_date, _ = get_month_range(month_str)
+    year, month = map(int, month_str.split('-'))
+    last_day = calendar.monthrange(year, month)[1]
+    end_date = datetime(year, month, last_day, 23, 59, 59)
     return start_date, end_date
 
 
@@ -797,9 +820,64 @@ def _normalize_carrier_code(carrier):
     Normalizuje kod przewoźnika do postaci używanej w raporcie.
     """
     normalized = str(carrier or '').strip().upper()
+    return normalized
+
+
+def _build_amount_expr_sql(amount_col_name):
+    """
+    Buduje wyrażenie SQL kwoty obrotu.
+    Dla pól finansowych monitora przechowywanych w groszach zwraca wartość w złotych.
+    """
+    amount_col_sql = sql.Identifier(amount_col_name)
+    if amount_col_name.lower() in {'fin_nalezn', 'fin_ptu_kwota'}:
+        return sql.SQL("(COALESCE({amount_col}, 0)::numeric / 100.0)").format(
+            amount_col=amount_col_sql
+        )
+    return sql.SQL("COALESCE({amount_col}, 0)").format(amount_col=amount_col_sql)
+
+
+def _display_carrier_label(carrier_code):
+    """
+    Zwraca etykietę przewoźnika do nagłówka raportu.
+    """
+    normalized = str(carrier_code or '').strip().upper()
     if normalized == 'KML':
         return 'KMŁ'
     return normalized
+
+
+def _resolve_transactions_table_for_carrier(carrier_code, default_table):
+    """
+    Zwraca nazwę tabeli transakcji dla przewoźnika.
+    Pozwala nadpisać domyślną tabelę dla wybranych schematów.
+    """
+    normalized = str(carrier_code or '').strip().upper()
+    return TRANSACTIONS_TABLE_OVERRIDES.get(normalized, default_table)
+
+
+def _resolve_transactions_device_col_for_carrier(carrier_code, default_device_col):
+    """
+    Zwraca kolumnę urządzenia dla przewoźnika (string lub lista fallbacków).
+    """
+    normalized = str(carrier_code or '').strip().upper()
+    return TRANSACTIONS_DEVICE_COL_OVERRIDES.get(normalized, default_device_col)
+
+
+def _resolve_transactions_amount_col_for_carrier(carrier_code, default_amount_col):
+    """
+    Zwraca kolumnę kwoty dla przewoźnika (string lub lista fallbacków).
+    """
+    normalized = str(carrier_code or '').strip().upper()
+    return TRANSACTIONS_AMOUNT_COL_OVERRIDES.get(normalized, default_amount_col)
+
+
+def _preview_column_name(column_ref):
+    """
+    Zwraca nazwę kolumny do podglądu SQL (dla list fallbacków używa pierwszej pozycji).
+    """
+    if isinstance(column_ref, (list, tuple)):
+        return column_ref[0] if column_ref else ''
+    return column_ref
 
 
 def _get_table_columns(conn, schema_name, table_name):
@@ -829,7 +907,6 @@ def _resolve_transactions_source(
     amount_col,
     date_col,
     device_col=None,
-    carrier_col=None,
 ):
     """
     Rozwiązuje źródło transakcji z jednego schematu.
@@ -841,46 +918,85 @@ def _resolve_transactions_source(
         return None
 
     lowered_map = {c.lower(): c for c in columns}
-    if amount_col.lower() not in lowered_map or date_col.lower() not in lowered_map:
+
+    if isinstance(amount_col, (list, tuple)):
+        picked_amount_col = _pick_first_matching_column(columns, list(amount_col))
+    else:
+        picked_amount_col = lowered_map.get(str(amount_col).lower())
+
+    if isinstance(date_col, (list, tuple)):
+        picked_date_col = _pick_first_matching_column(columns, list(date_col))
+    else:
+        picked_date_col = lowered_map.get(str(date_col).lower())
+
+    if picked_amount_col is None or picked_date_col is None:
         return None
 
     if device_col:
-        picked_device_col = lowered_map.get(device_col.lower())
+        if isinstance(device_col, (list, tuple)):
+            picked_device_col = _pick_first_matching_column(columns, list(device_col))
+        else:
+            picked_device_col = lowered_map.get(str(device_col).lower())
     else:
         picked_device_col = _pick_first_matching_column(columns, TRANSACTIONS_DEVICE_COL_CANDIDATES)
 
     if picked_device_col is None:
         return None
 
-    if carrier_col:
-        picked_carrier_col = lowered_map.get(carrier_col.lower())
-    else:
-        picked_carrier_col = _pick_first_matching_column(columns, TRANSACTIONS_CARRIER_COL_CANDIDATES)
-
     return {
         'schema': schema_name,
         'table': table_name,
         'device_col': picked_device_col,
-        'carrier_col': picked_carrier_col,
-        'amount_col': lowered_map[amount_col.lower()],
-        'date_col': lowered_map[date_col.lower()],
+        'amount_col': picked_amount_col,
+        'date_col': picked_date_col,
     }
+
+
+def build_transactions_debug_query(
+    schema_name,
+    month_str,
+    table_name=TRANSACTIONS_SOURCE_CONFIG['table'],
+    amount_col=TRANSACTIONS_SOURCE_CONFIG['amount_col'],
+    date_col=TRANSACTIONS_SOURCE_CONFIG['date_col'],
+    device_col=TRANSACTIONS_SOURCE_CONFIG['device_col'],
+):
+    """
+    Buduje gotowe zapytanie SQL diagnostyczne dla jednego schematu przewoźnika.
+    """
+    amount_col = _preview_column_name(amount_col)
+    date_col = _preview_column_name(date_col)
+    device_col = _preview_column_name(device_col)
+    start_date, end_date = get_month_range_closed(month_str)
+    amount_expr = f"COALESCE({amount_col}, 0)"
+    if amount_col.lower() in {'fin_nalezn', 'fin_ptu_kwota'}:
+        amount_expr = f"(COALESCE({amount_col}, 0)::numeric / 100.0)"
+    return f"""
+SELECT
+    {device_col} AS device_id,
+    SUM({amount_expr}) AS obrot_brutto_zl,
+    COUNT(*) AS liczba_transakcji
+FROM {schema_name}.{table_name}
+WHERE {device_col}::text ~ '^[0-9]+$'
+  AND (({device_col}::bigint BETWEEN 1101 AND 1141) OR ({device_col}::bigint BETWEEN 1201 AND 1299))
+  AND {date_col} >= TIMESTAMP '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
+  AND {date_col} <= TIMESTAMP '{end_date.strftime('%Y-%m-%d %H:%M:%S')}'
+GROUP BY {device_col}
+ORDER BY device_id;
+""".strip()
 
 
 def get_monthly_revenue_by_carrier(
     conn,
     month_str,
-    schema=SCHEMA,
     carriers=None,
     table_name=TRANSACTIONS_SOURCE_CONFIG['table'],
     amount_col=TRANSACTIONS_SOURCE_CONFIG['amount_col'],
     date_col=TRANSACTIONS_SOURCE_CONFIG['date_col'],
     device_col=TRANSACTIONS_SOURCE_CONFIG['device_col'],
-    carrier_col=None,
     use_device_range_filter=True,
 ):
     """
-    Pobiera obrót brutto per automat i per przewoźnik z tabeli <schema>.transactions.
+    Pobiera obrót brutto per automat i per przewoźnik z tabeli <carrier_schema>.transactions.
     Zwraca: dict {
         device_id: {
             'by_carrier': {
@@ -892,60 +1008,56 @@ def get_monthly_revenue_by_carrier(
         }
     }
     """
-    start_date, end_date = get_month_range(month_str)
+    start_date, end_date = get_month_range_closed(month_str)
     carriers = carriers or CARRIERS
 
     revenue_data = {}
 
-    source = _resolve_transactions_source(
-        conn,
-        schema_name=schema,
-        table_name=table_name,
-        amount_col=amount_col,
-        date_col=date_col,
-        device_col=device_col,
-        carrier_col=carrier_col,
-    )
-    if source is None:
-        print(
-            f"⚠ Pomijam tryb per przewoźnik: brak źródła {schema}.{table_name} "
-            f"lub wymaganych kolumn (date/amount/device)"
-        )
-        return {}
-
-    if source.get('carrier_col') is None:
-        print(
-            "⚠ Nie znaleziono kolumny przewoźnika w transactions. "
-            "Pomijam tryb per przewoźnik, aby uniknąć dublowania danych."
-        )
-        return {}
-
     for carrier in carriers:
         carrier_code = _normalize_carrier_code(carrier)
+        carrier_table_name = _resolve_transactions_table_for_carrier(carrier_code, table_name)
+        carrier_device_col = _resolve_transactions_device_col_for_carrier(carrier_code, device_col)
+        carrier_amount_col = _resolve_transactions_amount_col_for_carrier(carrier_code, amount_col)
+        source = _resolve_transactions_source(
+            conn,
+            schema_name=carrier_code,
+            table_name=carrier_table_name,
+            amount_col=carrier_amount_col,
+            date_col=date_col,
+            device_col=carrier_device_col,
+        )
+        if source is None:
+            print(
+                f"⚠ Pomijam przewoźnika {carrier} (schemat {carrier_code}): "
+                f"brak źródła {carrier_code}.{carrier_table_name} lub wymaganych kolumn "
+                f"({carrier_device_col}, {date_col}, {carrier_amount_col})"
+            )
+            continue
 
-        params = [start_date, end_date, carrier_code]
+        params = [start_date, end_date]
         device_filter_sql = sql.SQL('')
         if use_device_range_filter:
-            device_filter_sql = sql.SQL(" AND {device_filter}").format(
-                device_filter=_build_device_filter_sql(sql.Identifier(source['device_col']))
+            device_expr = sql.SQL("{device_col}::bigint").format(
+                device_col=sql.Identifier(source['device_col'])
             )
-        carrier_filter_sql = sql.SQL(
-            " AND UPPER(COALESCE({carrier_col}::text, '')) = %s"
-        ).format(
-            carrier_col=sql.Identifier(source['carrier_col'])
+            device_filter_sql = sql.SQL(" AND {device_filter}").format(
+                device_filter=_build_device_filter_sql(device_expr)
+            )
+        numeric_device_sql = sql.SQL(" AND {device_col}::text ~ '^[0-9]+$'").format(
+            device_col=sql.Identifier(source['device_col'])
         )
 
         query = sql.SQL(
             """
             SELECT
                 {device_col} AS device_id,
-                SUM(COALESCE({amount_col}, 0)) AS obrot_brutto_zl,
+                SUM({amount_expr}) AS obrot_brutto_zl,
                 COUNT(*) AS liczba_transakcji
             FROM {schema}.{table}
             WHERE {date_col} >= %s
-              AND {date_col} < %s
+                            AND {date_col} <= %s
+                            {numeric_device_filter}
               {device_filter}
-                            {carrier_filter}
             GROUP BY {device_col}
             ORDER BY device_id
             """
@@ -953,10 +1065,10 @@ def get_monthly_revenue_by_carrier(
             schema=sql.Identifier(source['schema']),
             table=sql.Identifier(source['table']),
             device_col=sql.Identifier(source['device_col']),
-            amount_col=sql.Identifier(source['amount_col']),
+            amount_expr=_build_amount_expr_sql(source['amount_col']),
             date_col=sql.Identifier(source['date_col']),
+            numeric_device_filter=numeric_device_sql,
             device_filter=device_filter_sql,
-            carrier_filter=carrier_filter_sql,
         )
 
         cursor = conn.cursor()
@@ -965,7 +1077,7 @@ def get_monthly_revenue_by_carrier(
             rows = cursor.fetchall()
             print(
                 f"✓ Obrót {carrier_code}: {source['schema']}.{source['table']} "
-                f"({source['device_col']}, {source['carrier_col']}, {source['amount_col']}, {source['date_col']}) -> {len(rows)} automatów"
+                f"({source['device_col']}, {source['amount_col']}, {source['date_col']}) -> {len(rows)} automatów"
             )
         except psycopg2.Error as e:
             print(f"⚠ Błąd pobierania obrotu dla {carrier_code}: {e}")
@@ -986,22 +1098,34 @@ def get_monthly_revenue_by_carrier(
                 'liczba_transakcji': int(liczba or 0),
             }
 
+        carrier_total = sum(float(r[1] or 0.0) for r in rows)
+        print(f"  Suma {carrier_code}: {carrier_total:,.2f} zł")
+
     return revenue_data
 
 
 # === EKSPORT DO EXCEL (KOLUMNY 1-2, RESZTA PLACEHOLDER) ===
 
-def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=None):
+def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=None, carriers=None):
     """
     Eksportuje raport P&L do Excela.
-    Kolumny:
-    1-INFO: nr_automatu, lokalizacja, status_zmiany
-    2-OBRÓT: obrot_brutto_zl, liczba_transakcji
-    3-PROWIZJA: prowizja_zl
-    5,7,8: placeholder (do ETAPU 2 i 3)
+    Układ danych: jeden wiersz per automat, kolumny brutto per przewoźnik.
     """
     if commission_data is None:
         commission_data = {}
+
+    carrier_order = []
+    for carrier in (carriers or CARRIERS):
+        code = _normalize_carrier_code(carrier)
+        if code not in carrier_order:
+            carrier_order.append(code)
+
+    for rev_entry in revenue_data.values():
+        by_carrier = rev_entry.get('by_carrier') if isinstance(rev_entry, dict) else None
+        if isinstance(by_carrier, dict):
+            for code in by_carrier.keys():
+                if code not in carrier_order:
+                    carrier_order.append(code)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filepath = OUTPUT_DIR / filename
@@ -1011,20 +1135,9 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename,
     ws.title = f"P&L {month_str}"
     
     # === NAGŁÓWKI ===
-    headers = [
-        # 1-INFO
-        'Nr automatu', 'Lokalizacja', 'Status', 'Przewoźnik',
-        # 2-OBRÓT
-        'Obrót brutto (zł)', 'Liczba transakcji',
-        # 3-PROWIZJA
-        'Prowizja (zł)',
-        # 5-KOSZTY (placeholder)
-        'Koszty (zł)',
-        # 7-PODSUMOWANIE ROCZNE (placeholder)
-        'Suma roczna',
-        # 8-UWAGI (placeholder)
-        'Uwagi'
-    ]
+    headers = ['Nr aut.', 'Lokalizacja automatu']
+    headers.extend([f"Brutto {_display_carrier_label(code)}" for code in carrier_order])
+    headers.append('Brutto Suma')
     
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_num)
@@ -1045,72 +1158,37 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename,
         # 1-INFO
         if device_id in dictionary_comparison:
             info = dictionary_comparison[device_id]
-            status = info['status']
             data = info['data']
             lokalizacja = extract_city_name(data.get('description', ''))
         else:
             lokalizacja = ''
-            status = 'brak w dict'
         
-        # Obsługa nowego modelu: revenue per (automat, przewoźnik).
         rev_by_carrier = {}
         if device_id in revenue_data:
             rev_entry = revenue_data[device_id]
             if isinstance(rev_entry, dict) and isinstance(rev_entry.get('by_carrier'), dict):
                 rev_by_carrier = rev_entry['by_carrier']
             elif isinstance(rev_entry, dict):
-                rev_by_carrier = {'': rev_entry}
+                if carrier_order:
+                    rev_by_carrier = {carrier_order[0]: rev_entry}
 
-        comm_by_carrier = {}
-        if device_id in commission_data:
-            comm_entry = commission_data[device_id]
-            if isinstance(comm_entry, dict) and isinstance(comm_entry.get('by_carrier'), dict):
-                comm_by_carrier = comm_entry['by_carrier']
-            elif isinstance(comm_entry, dict):
-                comm_by_carrier = {'': comm_entry}
+        ws.cell(row=row_num, column=1).value = device_id
+        ws.cell(row=row_num, column=2).value = lokalizacja
 
-        carriers_for_device = sorted(set(rev_by_carrier.keys()) | set(comm_by_carrier.keys()))
-        if not carriers_for_device:
-            carriers_for_device = ['']
-
-        for carrier in carriers_for_device:
-            # 2-OBRÓT
-            rev = rev_by_carrier.get(carrier)
+        row_total = 0.0
+        for idx, carrier_code in enumerate(carrier_order, start=3):
+            rev = rev_by_carrier.get(carrier_code)
+            amount = 0.0
             if isinstance(rev, dict):
-                obrot = rev.get('obrot_brutto_zl', 0.0)
-                liczba = rev.get('liczba_transakcji', 0)
-            else:
-                obrot = 0.0
-                liczba = 0
+                amount = float(rev.get('obrot_brutto_zl', 0.0) or 0.0)
+            ws.cell(row=row_num, column=idx).value = amount
+            ws.cell(row=row_num, column=idx).number_format = '#,##0.00'
+            row_total += amount
 
-            # 3-PROWIZJA
-            comm = comm_by_carrier.get(carrier)
-            if isinstance(comm, dict):
-                prowizja = comm.get('prowizja_zl', 0.0)
-            else:
-                prowizja = ''
-
-            # Placeholder dla kolumn 5,7,8
-            koszty = ''
-            suma_roczna = ''
-            uwagi = ''
-
-            # Wpisz dane do wiersza
-            ws.cell(row=row_num, column=1).value = device_id
-            ws.cell(row=row_num, column=2).value = lokalizacja
-            ws.cell(row=row_num, column=3).value = status
-            ws.cell(row=row_num, column=4).value = carrier
-            ws.cell(row=row_num, column=5).value = obrot
-            ws.cell(row=row_num, column=5).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=6).value = int(liczba)
-            ws.cell(row=row_num, column=7).value = prowizja
-            if isinstance(prowizja, (int, float)):
-                ws.cell(row=row_num, column=7).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=8).value = koszty
-            ws.cell(row=row_num, column=9).value = suma_roczna
-            ws.cell(row=row_num, column=10).value = uwagi
-
-            row_num += 1
+        total_col = 3 + len(carrier_order)
+        ws.cell(row=row_num, column=total_col).value = row_total
+        ws.cell(row=row_num, column=total_col).number_format = '#,##0.00'
+        row_num += 1
     
     # Dostosuj szerokość kolumn
     for col in ws.columns:
@@ -1162,13 +1240,13 @@ def main():
         '--obrot-source-mode',
         choices=['carrier-transactions', 'moneystats'],
         default='carrier-transactions',
-        help='Źródło obrotu: per przewoźnik z <schema>.transactions lub klasycznie z <schema>.moneystats'
+        help='Źródło obrotu: per schemat przewoźnika z <carrier>.transactions lub klasycznie z <schema>.moneystats'
     )
     parser.add_argument(
         '--obrot-carriers',
         nargs='*',
         default=CARRIERS,
-        help='Lista przewoźników do pobrania (np. IC PR KD ARP KW KS LKA SKM KMŁ)'
+        help='Lista przewoźników/schematów do pobrania (np. ARP IC KD KM KML KS KW LKA PR SKM)'
     )
     parser.add_argument(
         '--obrot-transactions-table',
@@ -1180,7 +1258,7 @@ def main():
         '--obrot-transactions-amount-col',
         type=str,
         default=TRANSACTIONS_SOURCE_CONFIG['amount_col'],
-        help='Kolumna kwoty w tabeli transakcji (domyślnie: fin_ptu_kwota)'
+        help='Kolumna kwoty w tabeli transakcji (domyślnie: fin_nalezn)'
     )
     parser.add_argument(
         '--obrot-transactions-date-col',
@@ -1192,13 +1270,12 @@ def main():
         '--obrot-transactions-device-col',
         type=str,
         default=TRANSACTIONS_SOURCE_CONFIG['device_col'],
-        help='Kolumna numeru automatu (opcjonalnie, domyślnie auto-detekcja)'
+        help='Kolumna numeru automatu (domyślnie: tvm_tvm_id)'
     )
     parser.add_argument(
-        '--obrot-transactions-carrier-col',
-        type=str,
-        default=None,
-        help='Kolumna przewoźnika w tabeli transactions (opcjonalnie, domyślnie auto-detekcja)'
+        '--obrot-print-sql',
+        action='store_true',
+        help='Wypisz zapytania SQL per przewoźnik/schemat dla wskazanego miesiąca'
     )
     parser.add_argument(
         '--miesiac',
@@ -1347,22 +1424,49 @@ def main():
     if args.obrot_source_mode == 'carrier-transactions':
         print(
             f"\n[3/5] Pobieranie obrotu za {month_str} "
-            f"(per przewoźnik: {source_schema}.{args.obrot_transactions_table})..."
+            f"(per schemat przewoźnika: <carrier>.{args.obrot_transactions_table})..."
         )
         if args.obrot_no_device_range_filter:
             print("  Filtr zakresów urządzeń: WYŁĄCZONY")
         print(f"  Przewoźnicy: {', '.join(args.obrot_carriers)}")
 
+        if args.obrot_print_sql:
+            print("  SQL diagnostyczny per schemat:")
+            for carrier in args.obrot_carriers:
+                carrier_code = _normalize_carrier_code(carrier)
+                carrier_table_name = _resolve_transactions_table_for_carrier(
+                    carrier_code,
+                    args.obrot_transactions_table,
+                )
+                carrier_device_col = _resolve_transactions_device_col_for_carrier(
+                    carrier_code,
+                    args.obrot_transactions_device_col,
+                )
+                carrier_amount_col = _resolve_transactions_amount_col_for_carrier(
+                    carrier_code,
+                    args.obrot_transactions_amount_col,
+                )
+                sql_preview = build_transactions_debug_query(
+                    schema_name=carrier_code,
+                    month_str=month_str,
+                    table_name=carrier_table_name,
+                    amount_col=carrier_amount_col,
+                    date_col=args.obrot_transactions_date_col,
+                    device_col=carrier_device_col,
+                )
+                print(
+                    f"\n--- {carrier} (schema: {carrier_code}, table: {carrier_table_name}) ---\n"
+                    f"{sql_preview}\n"
+                )
+
         revenue_data = get_monthly_revenue_by_carrier(
             conn,
             month_str,
-            schema=source_schema,
             carriers=args.obrot_carriers,
             table_name=args.obrot_transactions_table,
             amount_col=args.obrot_transactions_amount_col,
             date_col=args.obrot_transactions_date_col,
             device_col=args.obrot_transactions_device_col,
-            carrier_col=args.obrot_transactions_carrier_col,
             use_device_range_filter=not args.obrot_no_device_range_filter,
         )
 
@@ -1429,12 +1533,19 @@ def main():
     # === KROK 4: Eksport do Excel ===
     print(f"\n[5/5] Eksport do Excel...")
     filename = build_output_filename(month_str, naming_mode=args.output_naming)
-    export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=commission_data)
+    export_to_excel_PL(
+        dictionary_comparison,
+        revenue_data,
+        month_str,
+        filename,
+        commission_data=commission_data,
+        carriers=args.obrot_carriers,
+    )
     
     print(f"\n{'='*60}")
     print(f"  ✓ RAPORT ZAKOŃCZONY POMYŚLNIE")
-    print(f"  Kolumny zaimplementowane: 1-INFO, 2-OBRÓT, 3-PROWIZJA")
-    print(f"  Do zrobienia (ETAP 2): kolumny 4-6")
+    print("  Układ: jeden wiersz na automat, kolumny brutto per przewoźnik + Brutto Suma")
+    print("  Braki danych per przewoźnik są wpisywane jako 0")
     print(f"{'='*60}\n")
 
 
