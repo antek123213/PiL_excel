@@ -12,6 +12,13 @@ from pathlib import Path
 import re
 import calendar
 
+
+def _silent_print(*args, **kwargs):
+    return None
+
+
+print = _silent_print
+
 # === KONFIGURACJA ===
 DB_CONFIG = {
     'host': '192.168.101.20',
@@ -31,7 +38,7 @@ DEVICE_ID_RANGES = (
     (1201, 1299),
 )
 
-CARRIERS = ['ARP', 'IC', 'KD', 'KM', 'KML', 'KS', 'KW', 'LKA', 'PR', 'SKM']
+CARRIERS = ['ARP', 'IC', 'KD', 'KM', 'KML', 'KW', 'LKA', 'PR', 'SKM']
 TRANSACTIONS_SOURCE_CONFIG = {
     'table': 'transactions',
     'amount_col': 'fin_nalezn',
@@ -141,6 +148,20 @@ def extract_city_name(description):
     if result in ('Opis', 'opis', ''):
         return ''
     return result
+
+
+def _normalize_tvm_location_text(value):
+    """
+    Normalizuje pełny tekst lokalizacji z pól TVM.
+    """
+    if value is None:
+        return ''
+    normalized = str(value).strip()
+    if not normalized:
+        return ''
+    if 'opis' in normalized.lower():
+        return ''
+    return normalized
 
 
 # === FUNKCJE POMOCNICZE: DIAGNOSTYKA BAZY DANYCH ===
@@ -330,6 +351,147 @@ def get_dictionary_snapshot(conn, schema=SCHEMA):
         }
     
     return snapshot
+
+
+def _resolve_dictionary_location_source(conn, schema_name, table_name='dictionary'):
+    """
+    Rozpoznaje kolumny słownika dla lokalizacji (id, tvm_tvmlocation1, tvm_tvmlocation2, description).
+    Zwraca dict lub None, gdy tabela/kolumny nie są dostępne.
+    """
+    columns = _get_table_columns(conn, schema_name, table_name)
+    if not columns:
+        return None
+
+    lowered_map = {c.lower(): c for c in columns}
+    device_col = lowered_map.get('id')
+    tvm_location1_col = lowered_map.get('tvm_tvmlocation1')
+    tvm_location2_col = lowered_map.get('tvm_tvmlocation2')
+    description_col = lowered_map.get('description')
+
+    if device_col is None:
+        return None
+    if tvm_location1_col is None and tvm_location2_col is None and description_col is None:
+        return None
+
+    return {
+        'schema': schema_name,
+        'table': table_name,
+        'device_col': device_col,
+        'tvm_location1_col': tvm_location1_col,
+        'tvm_location2_col': tvm_location2_col,
+        'description_col': description_col,
+    }
+
+
+def _pick_location_value(tvm_location1, tvm_location2, description):
+    """
+    Wybiera lokalizację z priorytetem:
+    tvm_tvmlocation1 -> tvm_tvmlocation2 -> description.
+
+    Dla pól TVM zachowuje pełny adres.
+    Description jest używane tylko, gdy oba pola TVM są puste.
+    Zwraca pusty string, gdy brak sensownej wartości.
+    """
+    normalized_1 = _normalize_tvm_location_text(tvm_location1)
+    normalized_2 = _normalize_tvm_location_text(tvm_location2)
+
+    if normalized_1 and normalized_2:
+        return f"{normalized_1}, {normalized_2}"
+    if normalized_1:
+        return normalized_1
+    if normalized_2:
+        return normalized_2
+
+    return extract_city_name(description)
+
+
+def get_locations_by_carrier(
+    conn,
+    device_ids,
+    carriers=None,
+    dictionary_table='dictionary',
+):
+    """
+    Uzupełnia lokalizacje automatów sekwencyjnie po przewoźnikach.
+    Priorytet pól: tvm_tvmlocation1 -> tvm_tvmlocation2 -> description.
+    Dla automatu, który już ma lokalizację, kolejne schematy są pomijane.
+
+    Zwraca dict {device_id: 'lokalizacja'}.
+    """
+    carriers = carriers or CARRIERS
+    missing_device_ids = {int(device_id) for device_id in device_ids}
+    location_by_device = {}
+
+    for carrier in carriers:
+        if not missing_device_ids:
+            break
+
+        carrier_code = _normalize_carrier_code(carrier)
+        source = _resolve_dictionary_location_source(
+            conn,
+            schema_name=carrier_code,
+            table_name=dictionary_table,
+        )
+        if source is None:
+            print(
+                f"⚠ Pomijam lokalizacje dla {carrier} (schemat {carrier_code}): "
+                f"brak źródła {carrier_code}.{dictionary_table} lub wymaganych kolumn"
+            )
+            continue
+
+        selected_columns = [
+            sql.Identifier(source['device_col']),
+            sql.Identifier(source['tvm_location1_col']) if source['tvm_location1_col'] else sql.SQL('NULL'),
+            sql.Identifier(source['tvm_location2_col']) if source['tvm_location2_col'] else sql.SQL('NULL'),
+            sql.Identifier(source['description_col']) if source['description_col'] else sql.SQL('NULL'),
+        ]
+
+        query = sql.SQL(
+            """
+                        SELECT {device_col}, {tvm_location1_col}, {tvm_location2_col}, {description_col}
+            FROM {schema}.{table}
+            WHERE {device_col}::text ~ '^[0-9]+$'
+              AND {device_filter}
+            ORDER BY {device_col}
+            """
+        ).format(
+            device_col=selected_columns[0],
+                        tvm_location1_col=selected_columns[1],
+                        tvm_location2_col=selected_columns[2],
+                        description_col=selected_columns[3],
+            schema=sql.Identifier(source['schema']),
+            table=sql.Identifier(source['table']),
+            device_filter=_build_device_filter_sql(
+                sql.SQL("{device_col}::bigint").format(device_col=selected_columns[0])
+            ),
+        )
+
+        cursor = conn.cursor()
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        cursor.close()
+
+        filled_for_carrier = 0
+        for row in rows:
+            device_id, tvm_location1, tvm_location2, description = row
+            normalized_device_id = int(device_id)
+            if normalized_device_id not in missing_device_ids:
+                continue
+
+            picked_location = _pick_location_value(tvm_location1, tvm_location2, description)
+            if not picked_location:
+                continue
+
+            location_by_device[normalized_device_id] = picked_location
+            missing_device_ids.remove(normalized_device_id)
+            filled_for_carrier += 1
+
+        print(
+            f"✓ Lokalizacje: {carrier_code} -> +{filled_for_carrier}, "
+            f"braki po kroku: {len(missing_device_ids)}"
+        )
+
+    return location_by_device
 
 
 def load_previous_snapshot(month_str):
@@ -1106,7 +1268,15 @@ def get_monthly_revenue_by_carrier(
 
 # === EKSPORT DO EXCEL (KOLUMNY 1-2, RESZTA PLACEHOLDER) ===
 
-def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename, commission_data=None, carriers=None):
+def export_to_excel_PL(
+    dictionary_comparison,
+    revenue_data,
+    month_str,
+    filename,
+    commission_data=None,
+    carriers=None,
+    location_by_device=None,
+):
     """
     Eksportuje raport P&L do Excela.
     Układ danych: jeden wiersz per automat, kolumny brutto per przewoźnik.
@@ -1148,6 +1318,7 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename,
     
     # === DANE ===
     row_num = 2
+    location_by_device = location_by_device or {}
     # Upewnij się, że wszystkie klucze są integerami
     all_device_ids = sorted(set(
         [int(k) for k in dictionary_comparison.keys()] + 
@@ -1155,13 +1326,12 @@ def export_to_excel_PL(dictionary_comparison, revenue_data, month_str, filename,
     ))
     
     for device_id in all_device_ids:
-        # 1-INFO
-        if device_id in dictionary_comparison:
+        # 1-INFO (najpierw mapa lokalizacji zebrana po przewoźnikach)
+        lokalizacja = location_by_device.get(device_id, '')
+        if not lokalizacja and device_id in dictionary_comparison:
             info = dictionary_comparison[device_id]
             data = info['data']
             lokalizacja = extract_city_name(data.get('description', ''))
-        else:
-            lokalizacja = ''
         
         rev_by_carrier = {}
         if device_id in revenue_data:
@@ -1246,7 +1416,7 @@ def main():
         '--obrot-carriers',
         nargs='*',
         default=CARRIERS,
-        help='Lista przewoźników/schematów do pobrania (np. ARP IC KD KM KML KS KW LKA PR SKM)'
+        help='Lista przewoźników/schematów do pobrania (np. ARP IC KD KM KML KW LKA PR SKM)'
     )
     parser.add_argument(
         '--obrot-transactions-table',
@@ -1392,12 +1562,12 @@ def main():
         return
     
     # === KROK 1: Słownik automatów (ARP.dictionary) ===
-    print(f"\n[1/5] Pobieranie słownika automatów ({source_schema}.dictionary)...")
+    print(f"\n[1/6] Pobieranie słownika automatów ({source_schema}.dictionary)...")
     current_snapshot = get_dictionary_snapshot(conn, schema=source_schema)
     print(f"✓ Pobrano {len(current_snapshot)} automatów ze słownika")
     
     # Porównaj z poprzednim miesiącem
-    print("\n[2/5] Porównanie z poprzednim miesiącem...")
+    print("\n[2/6] Porównanie z poprzednim miesiącem...")
     previous_snapshot = load_previous_snapshot(month_str)
     
     if previous_snapshot is None:
@@ -1423,7 +1593,7 @@ def main():
     revenue_data = {}
     if args.obrot_source_mode == 'carrier-transactions':
         print(
-            f"\n[3/5] Pobieranie obrotu za {month_str} "
+            f"\n[3/6] Pobieranie obrotu za {month_str} "
             f"(per schemat przewoźnika: <carrier>.{args.obrot_transactions_table})..."
         )
         if args.obrot_no_device_range_filter:
@@ -1482,7 +1652,7 @@ def main():
         )
         print(f"✓ Pobrano dane obrotu dla {len(revenue_data)} automatów (model per przewoźnik)")
     else:
-        print(f"\n[3/5] Pobieranie obrotu za {month_str} ({source_schema}.moneystats)...")
+        print(f"\n[3/6] Pobieranie obrotu za {month_str} ({source_schema}.moneystats)...")
         if args.obrot_actioncodes:
             print(f"  Filtr ms_actioncode: {args.obrot_actioncodes}")
         if args.obrot_mctype is not None:
@@ -1506,7 +1676,7 @@ def main():
     print(f"  Liczba transakcji: {total_transactions:,}")
 
     # === KROK 3: Prowizja miesięczna ===
-    print(f"\n[4/5] Pobieranie prowizji za {month_str}...")
+    print(f"\n[4/6] Pobieranie prowizji za {month_str}...")
     commission_data = get_monthly_commission(
         conn,
         month_str,
@@ -1528,10 +1698,23 @@ def main():
             print(f"  Nadmiarowe w SQL: {len(comparison['extra_in_sql'])}")
             print(f"  Różnice kwot: {len(comparison['mismatches'])}")
     
+    # === KROK 4: Lokalizacje automatów per przewoźnik ===
+    print(f"\n[5/6] Uzupełnianie lokalizacji automatów ({', '.join(args.obrot_carriers)})...")
+    all_device_ids = sorted(set(
+        [int(k) for k in dictionary_comparison.keys()] +
+        [int(k) for k in revenue_data.keys()]
+    ))
+    location_by_device = get_locations_by_carrier(
+        conn,
+        device_ids=all_device_ids,
+        carriers=args.obrot_carriers,
+    )
+    print(f"✓ Uzupełniono lokalizacje dla {len(location_by_device)} / {len(all_device_ids)} automatów")
+
     conn.close()
-    
-    # === KROK 4: Eksport do Excel ===
-    print(f"\n[5/5] Eksport do Excel...")
+
+    # === KROK 5: Eksport do Excel ===
+    print(f"\n[6/6] Eksport do Excel...")
     filename = build_output_filename(month_str, naming_mode=args.output_naming)
     export_to_excel_PL(
         dictionary_comparison,
@@ -1540,6 +1723,7 @@ def main():
         filename,
         commission_data=commission_data,
         carriers=args.obrot_carriers,
+        location_by_device=location_by_device,
     )
     
     print(f"\n{'='*60}")
