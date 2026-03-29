@@ -1,0 +1,5 @@
+# External dependencies required by the project.
+# Standard library modules (json, argparse, datetime, etc.) are not listed here.
+openpyxl
+psycopg2-binary
+python-dateutil

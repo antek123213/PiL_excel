@@ -33,17 +33,23 @@ DB_CONFIG = {
 SCHEMA = 'ARP'
 SNAPSHOT_DIR = Path(__file__).parent / 'snapshots'
 OUTPUT_DIR = Path(__file__).parent / 'output'
+DEFAULT_COSTS_FILE = Path(__file__).parent / 'P&L_2025.11.25_koszty_ROP 2025.xlsx'
+DEFAULT_RENT_FILE = Path(__file__).parent / 'Najem powierzchni 2025-2026.xlsx'
+DEFAULT_AMORTYZACJA_FILE = Path(__file__).parent / 'Amortyzacja miesieczna Automaty.xlsx'
+DEFAULT_AMORTYZACJA_SHEET = 'bb8'
 DEVICE_ID_RANGES = (
     (1101, 1141),
     (1201, 1299),
 )
 
-CARRIERS = ['ARP', 'IC', 'KD', 'KM', 'KML', 'KW', 'LKA', 'PR', 'SKM']
+CARRIERS = ['ARP', 'IC', 'KD', 'KML', 'KW', 'LKA', 'PR', 'SKM']
+DISALLOWED_CARRIERS = {'KM'}
 TRANSACTIONS_SOURCE_CONFIG = {
     'table': 'transactions',
     'amount_col': 'fin_nalezn',
     'date_col': 'fin_data_sp',
     'device_col': 'tvm_tvm_id',
+    'payment_method_col': 'fin_spos_opl',
 }
 TRANSACTIONS_TABLE_OVERRIDES = {
     'IC': 'transactionsns',
@@ -53,8 +59,57 @@ TRANSACTIONS_DEVICE_COL_OVERRIDES = {
     'IC': ['tvm_aitomatnum', 'tvm_automatnum'],
 }
 TRANSACTIONS_AMOUNT_COL_OVERRIDES = {
-    # User-required precedence: fin_cen_jedn first, then fin_cena_jedn.
-    'KM': ['fin_cen_jedn', 'fin_cena_jedn'],
+}
+TRANSACTIONS_PAYMENT_METHOD_COL_OVERRIDES = {
+}
+TRANSACTIONS_PAYMENT_METHOD_COL_CANDIDATES = [
+    'fin_spos_opl',
+    'spos_opl',
+    'payment_method',
+    'payment_method_code',
+]
+PAYMENT_METHOD_CODE_TO_KEY = {
+    '1': 'gotowka',
+    '2': 'karta',
+    '6': 'blik',
+}
+PAYMENT_METHOD_KEYS = ('gotowka', 'karta', 'blik')
+PAYMENT_METHOD_LABELS = {
+    'gotowka': 'Gotówka',
+    'karta': 'Karta',
+    'blik': 'BLIK',
+}
+TVM_COST_KEYS = (
+    'czynsz',
+    'prad',
+    'elavon',
+    'poczta_polska',
+    'amortyzacja',
+    'utrzymanie_oprogramowania',
+    'papier',
+    'transmisja_danych',
+    'serwis',
+    'it_card',
+    'ubezpieczenie',
+)
+TVM_COST_LABELS = {
+    'czynsz': 'czynsz',
+    'prad': 'prad',
+    'elavon': 'elavon',
+    'poczta_polska': 'poczta polska',
+    'amortyzacja': 'amortyzacja',
+    'utrzymanie_oprogramowania': 'utrzymanie oprogramowania',
+    'papier': 'papier',
+    'transmisja_danych': 'transmisja danych',
+    'serwis': 'serwis',
+    'it_card': 'IT card',
+    'ubezpieczenie': 'ubezpieczenie',
+}
+OTHER_COST_KEYS = ('non_tvm', 'project_variable_costs', 'oh')
+OTHER_COST_LABELS = {
+    'non_tvm': 'NON TVM',
+    'project_variable_costs': 'Project Variable Costs',
+    'oh': 'OH',
 }
 TRANSACTIONS_DEVICE_COL_CANDIDATES = [
     'fin_nr_urz',
@@ -351,6 +406,75 @@ def get_dictionary_snapshot(conn, schema=SCHEMA):
         }
     
     return snapshot
+
+
+def _extract_automat_type_suffix(groupid_value):
+    """
+    Wyciąga suffix typu automatu z pola groupid, np. AUTABB -> BB.
+    """
+    normalized = str(groupid_value or '').strip().upper()
+    if not normalized.startswith('AUTA'):
+        return ''
+    return normalized[4:]
+
+
+def get_automat_type_by_device_from_av(
+    conn,
+    device_ids,
+    schema_name='AV',
+    table_name='dictionary',
+    value_col='value',
+    groupid_col='groupid',
+):
+    """
+    Pobiera typ automatu z AV.dictionary po kolumnie `value` i zwraca mapę:
+    {device_id: 'BB' | ...}.
+    """
+    normalized_ids = sorted({int(device_id) for device_id in device_ids})
+    if not normalized_ids:
+        return {}
+
+    columns = _get_table_columns(conn, schema_name, table_name)
+    if not columns:
+        print(f"⚠ Brak tabeli typu automatu: {schema_name}.{table_name}")
+        return {}
+
+    lowered = {c.lower(): c for c in columns}
+    resolved_value_col = lowered.get(str(value_col).lower())
+    resolved_groupid_col = lowered.get(str(groupid_col).lower())
+    if resolved_value_col is None or resolved_groupid_col is None:
+        print(
+            f"⚠ Brak kolumn typu automatu w {schema_name}.{table_name}: "
+            f"{value_col}, {groupid_col}"
+        )
+        return {}
+
+    search_values = [str(device_id) for device_id in normalized_ids]
+    cursor = conn.cursor()
+    query = sql.SQL(
+        """
+        SELECT {value_col}, {groupid_col}
+        FROM {schema}.{table}
+        WHERE {value_col}::text = ANY(%s)
+        """
+    ).format(
+        value_col=sql.Identifier(resolved_value_col),
+        groupid_col=sql.Identifier(resolved_groupid_col),
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+    )
+    cursor.execute(query, (search_values,))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    type_map = {}
+    for raw_value, groupid in rows:
+        device_id = _parse_device_id(raw_value)
+        if device_id is None:
+            continue
+        type_map[device_id] = _extract_automat_type_suffix(groupid)
+
+    return type_map
 
 
 def _resolve_dictionary_location_source(conn, schema_name, table_name='dictionary'):
@@ -899,6 +1023,552 @@ def validate_provision_sql_vs_xls(conn, month_str, commission_source, xls_path, 
     return comparison, exit_code
 
 
+def _as_float(value):
+    """
+    Konwertuje wartość na float. Zwraca 0.0 dla pustych/nienumerycznych.
+    """
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _matches_month(value, month_str):
+    """
+    Sprawdza czy wartość daty należy do miesiąca raportowego YYYY-MM.
+    """
+    if value is None:
+        return False
+    if hasattr(value, 'year') and hasattr(value, 'month'):
+        return f"{value.year:04d}-{value.month:02d}" == month_str
+    return False
+
+
+def _extract_monthly_value_in_section(ws, section_label, month_str, month_col=2, value_col=3):
+    """
+    Odczytuje miesięczną wartość z bloku sekcji oznaczonej etykietą w kolumnie B.
+    """
+    section_row = None
+    normalized_label = str(section_label or '').strip().upper()
+    for r in range(1, ws.max_row + 1):
+        cell_val = ws.cell(r, month_col).value
+        if isinstance(cell_val, str) and str(cell_val).strip().upper() == normalized_label:
+            section_row = r
+            break
+
+    if section_row is None:
+        return 0.0
+
+    value = 0.0
+    for r in range(section_row + 1, ws.max_row + 1):
+        marker = ws.cell(r, month_col).value
+        if isinstance(marker, str) and marker.strip():
+            break
+        if _matches_month(marker, month_str):
+            value += _as_float(ws.cell(r, value_col).value)
+    return value
+
+
+def _find_section_row(ws, section_label, label_col=2):
+    """
+    Zwraca numer wiersza sekcji opisanej etykietą w zadanej kolumnie.
+    """
+    normalized_label = str(section_label or '').strip().upper()
+    for r in range(1, ws.max_row + 1):
+        cell_val = ws.cell(r, label_col).value
+        if isinstance(cell_val, str) and str(cell_val).strip().upper() == normalized_label:
+            return r
+    return None
+
+
+def _extract_monthly_value_from_columns(ws, month_str, month_col, value_col, start_row=1, end_row=None):
+    """
+    Sumuje wartości dla miesiąca w zadanych kolumnach (układ tabelaryczny bez sekcji).
+    """
+    if end_row is None:
+        end_row = ws.max_row
+
+    total = 0.0
+    for r in range(max(1, int(start_row)), min(ws.max_row, int(end_row)) + 1):
+        month_cell = ws.cell(r, month_col).value
+        if _matches_month(month_cell, month_str):
+            total += _as_float(ws.cell(r, value_col).value)
+    return total
+
+
+def _get_section_end_row(ws, section_row, section_label_col=2):
+    """
+    Szuka końca sekcji: pierwszy kolejny wiersz z nową etykietą sekcji.
+    """
+    if section_row is None:
+        return ws.max_row
+
+    for r in range(section_row + 1, ws.max_row + 1):
+        marker = ws.cell(r, section_label_col).value
+        if isinstance(marker, str) and marker.strip():
+            return r - 1
+    return ws.max_row
+
+
+def _extract_monthly_value_from_header_table(ws, month_str, header_label, month_col, value_col, header_col=None):
+    """
+    Odczytuje wartość dla miesiąca z tabeli identyfikowanej nagłówkiem (np. Non TVMs/Project).
+    Zakłada, że dane tabeli są w kolejnych wierszach pod nagłówkiem i kończą się przy pierwszej
+    pustej komórce miesiąca po rozpoczęciu bloku dat.
+    """
+    header_row = _find_section_row(ws, header_label, label_col=header_col or value_col)
+    if header_row is None:
+        return 0.0
+
+    total = 0.0
+    seen_date_rows = False
+    for r in range(header_row + 1, ws.max_row + 1):
+        month_cell = ws.cell(r, month_col).value
+
+        if _matches_month(month_cell, month_str):
+            total += _as_float(ws.cell(r, value_col).value)
+            seen_date_rows = True
+            continue
+
+        if hasattr(month_cell, 'year') and hasattr(month_cell, 'month'):
+            seen_date_rows = True
+            continue
+
+        if month_cell is None and seen_date_rows:
+            break
+
+        if isinstance(month_cell, str) and month_cell.strip():
+            break
+
+    return total
+
+
+def _normalize_header_text(value):
+    """
+    Normalizuje tekst nagłówka do porównań (usuwa spacje, kropki i znaki specjalne).
+    """
+    if value is None:
+        return ''
+    return re.sub(r'[^A-Z0-9]+', '', str(value).strip().upper())
+
+
+def _normalize_text_for_match(value):
+    """
+    Normalizuje tekst do porównań fuzzy (lokalizacje, nazwy) usuwając separatory.
+    """
+    if value is None:
+        return ''
+    return re.sub(r'[^A-Z0-9]+', '', str(value).strip().upper())
+
+
+def _build_month_year_labels(month_str):
+    """
+    Zwraca etykiety miesiąca w formatach użytecznych do wyszukiwania nagłówków.
+    """
+    dt = datetime.strptime(month_str, '%Y-%m')
+    return dt.strftime('%m/%Y'), dt.strftime('%m%Y')
+
+
+def _parse_device_id(value):
+    """
+    Konwertuje numer automatu do int; zwraca None dla wartości niejednoznacznych.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return None
+
+    text = str(value).strip().replace(',', '.')
+    if not text:
+        return None
+    if re.fullmatch(r'\d+(\.0+)?', text):
+        return int(float(text))
+    return None
+
+
+def _build_month_header_targets(month_str):
+    """
+    Buduje zestaw tokenów nagłówka miesiąca dla wyszukiwania kolumn w Excel.
+    """
+    dt = datetime.strptime(month_str, '%Y-%m')
+    month_str_slash = dt.strftime('%m/%Y')
+    month_str_dot = dt.strftime('%m.%Y')
+    month_str_dash = dt.strftime('%Y-%m')
+    month_str_compact = dt.strftime('%m%Y')
+
+    tokens = {
+        _normalize_header_text(month_str_slash),
+        _normalize_header_text(month_str_dot),
+        _normalize_header_text(month_str_dash),
+        _normalize_header_text(month_str_compact),
+        _normalize_header_text(f"Amortyzacja {month_str_slash}"),
+        _normalize_header_text(f"Amortyzacja {month_str_dot}"),
+        _normalize_header_text(f"Amortyzacja {month_str_dash}"),
+        _normalize_header_text(f"Amortyzacja {month_str_compact}"),
+    }
+    return {token for token in tokens if token}
+
+
+def _load_bb_amortyzacja_sources(
+    month_str,
+    amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
+    amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
+):
+    """
+    Wczytuje źródła amortyzacji BB z arkusza bb8:
+    - mapę po nazwie lokalizacji (kolumna Nazwa)
+    - mapę po numerze inwentarzowym (kolumna Nr.inw)
+    Kolumna kwoty jest wykrywana dynamicznie po miesiącu raportu.
+    """
+    result = {
+        'by_location': {},
+        'by_nr_inw': {},
+        'stats': {
+            'rows_read': 0,
+            'duplicates_location': 0,
+            'duplicates_nr_inw': 0,
+        },
+    }
+    if amortyzacja_file is None:
+        return result
+
+    amort_path = Path(amortyzacja_file)
+    if not amort_path.exists():
+        print(f"⚠ Brak pliku amortyzacji: {amort_path}")
+        return result
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(amort_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku amortyzacji: {e}")
+        return result
+
+    sheet_name = str(amortyzacja_sheet or DEFAULT_AMORTYZACJA_SHEET)
+    if sheet_name not in wb.sheetnames:
+        print(f"⚠ Brak arkusza {sheet_name} w pliku amortyzacji: {amort_path.name}")
+        return result
+
+    ws = wb[sheet_name]
+    month_tokens = _build_month_header_targets(month_str)
+
+    header_row = None
+    nazwa_col = None
+    nr_inw_col = None
+    amount_col = None
+
+    scan_to = min(ws.max_row, 60)
+    for r in range(1, scan_to + 1):
+        row_nazwa_col = None
+        row_nr_inw_col = None
+        row_amount_col = None
+
+        for c in range(1, ws.max_column + 1):
+            normalized = _normalize_header_text(ws.cell(r, c).value)
+            if not normalized:
+                continue
+
+            if normalized in {'NAZWA'}:
+                row_nazwa_col = c
+            if normalized in {'NRINW', 'NRINWENTARZOWY'}:
+                row_nr_inw_col = c
+            if (
+                normalized in month_tokens
+                or any(token and token in normalized for token in month_tokens)
+            ):
+                row_amount_col = c
+
+        if row_nazwa_col and row_amount_col:
+            header_row = r
+            nazwa_col = row_nazwa_col
+            nr_inw_col = row_nr_inw_col
+            amount_col = row_amount_col
+            break
+
+    if header_row is None:
+        print(
+            "⚠ Nie znaleziono kolumn amortyzacji BB (Nazwa + miesiąc) "
+            f"w arkuszu {sheet_name}"
+        )
+        return result
+
+    if nazwa_col is None or amount_col is None:
+        print(f"⚠ Niekompletna konfiguracja kolumn amortyzacji BB w arkuszu {sheet_name}")
+        return result
+
+    nazwa_col = int(nazwa_col)
+    amount_col = int(amount_col)
+    if nr_inw_col is not None:
+        nr_inw_col = int(nr_inw_col)
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        raw_nazwa = ws.cell(r, nazwa_col).value
+        raw_amount = ws.cell(r, amount_col).value
+        raw_nr_inw = ws.cell(r, nr_inw_col).value if nr_inw_col else None
+
+        if raw_nazwa is None and raw_amount is None and raw_nr_inw is None:
+            continue
+
+        result['stats']['rows_read'] += 1
+        amount = _as_float(raw_amount)
+
+        normalized_name = _normalize_text_for_match(raw_nazwa)
+        if normalized_name:
+            if normalized_name in result['by_location']:
+                result['stats']['duplicates_location'] += 1
+            result['by_location'][normalized_name] = amount
+
+        parsed_nr_inw = _parse_device_id(raw_nr_inw)
+        if parsed_nr_inw is not None:
+            if parsed_nr_inw in result['by_nr_inw']:
+                result['stats']['duplicates_nr_inw'] += 1
+            result['by_nr_inw'][parsed_nr_inw] = amount
+
+    return result
+
+
+def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_sheet=None):
+    """
+    Wczytuje czynsz i prąd per automat z pliku najmu.
+    Oczekuje kolumn: Nr.automatu, Czynsz MM/YYYY, Energia MM/YYYY.
+    """
+    if rent_file is None:
+        return {}
+
+    rent_path = Path(rent_file)
+    if not rent_path.exists():
+        print(f"⚠ Brak pliku najmu: {rent_path}")
+        return {}
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(rent_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku najmu: {e}")
+        return {}
+
+    year_sheet = month_str.split('-')[0]
+    sheet_name = str(rent_sheet or year_sheet)
+    if sheet_name not in wb.sheetnames:
+        print(f"⚠ Brak arkusza {sheet_name} w pliku najmu: {rent_path.name}")
+        return {}
+
+    ws = wb[sheet_name]
+    month_label_slash, month_label_compact = _build_month_year_labels(month_str)
+
+    header_row = None
+    device_col = None
+    czynsz_col = None
+    prad_col = None
+
+    czynsz_targets = {
+        _normalize_header_text(f"Czynsz {month_label_slash}"),
+        _normalize_header_text(f"Czynsz{month_label_slash}"),
+        _normalize_header_text(f"Czynsz {month_label_compact}"),
+        _normalize_header_text(f"Czynsz{month_label_compact}"),
+    }
+    prad_targets = {
+        _normalize_header_text(f"Energia {month_label_slash}"),
+        _normalize_header_text(f"Energia{month_label_slash}"),
+        _normalize_header_text(f"Energia {month_label_compact}"),
+        _normalize_header_text(f"Energia{month_label_compact}"),
+        _normalize_header_text(f"Prad {month_label_slash}"),
+        _normalize_header_text(f"Prad{month_label_slash}"),
+        _normalize_header_text(f"Prad {month_label_compact}"),
+        _normalize_header_text(f"Prad{month_label_compact}"),
+    }
+
+    scan_to = min(ws.max_row, 60)
+    for r in range(1, scan_to + 1):
+        row_device_col = None
+        row_czynsz_col = None
+        row_prad_col = None
+
+        for c in range(1, ws.max_column + 1):
+            raw_header = ws.cell(r, c).value
+            normalized_header = _normalize_header_text(raw_header)
+            if not normalized_header:
+                continue
+
+            if normalized_header == 'NRAUTOMATU':
+                row_device_col = c
+            if normalized_header in czynsz_targets:
+                row_czynsz_col = c
+            if normalized_header in prad_targets:
+                row_prad_col = c
+
+        if row_device_col and row_czynsz_col and row_prad_col:
+            header_row = r
+            device_col = row_device_col
+            czynsz_col = row_czynsz_col
+            prad_col = row_prad_col
+            break
+
+    if header_row is None:
+        print(
+            "⚠ Nie znaleziono wymaganych kolumn najmu: "
+            f"Nr.automatu, Czynsz {month_label_slash}, Energia {month_label_slash}"
+        )
+        return {}
+
+    if device_col is None or czynsz_col is None or prad_col is None:
+        print("⚠ Niekompletna konfiguracja kolumn najmu")
+        return {}
+
+    device_col = int(device_col)
+    czynsz_col = int(czynsz_col)
+    prad_col = int(prad_col)
+
+    rent_map = {}
+    skipped_rows = 0
+    for r in range(header_row + 1, ws.max_row + 1):
+        raw_device = ws.cell(r, device_col).value
+        raw_czynsz = ws.cell(r, czynsz_col).value
+        raw_prad = ws.cell(r, prad_col).value
+
+        if raw_device is None and raw_czynsz is None and raw_prad is None:
+            continue
+
+        device_id = _parse_device_id(raw_device)
+        if device_id is None:
+            skipped_rows += 1
+            continue
+
+        rent_map[device_id] = {
+            'czynsz': _as_float(raw_czynsz),
+            'prad': _as_float(raw_prad),
+        }
+
+    if skipped_rows:
+        print(f"⚠ Pominięto {skipped_rows} wierszy najmu z nieprawidłowym Nr.automatu")
+
+    return rent_map
+
+
+def _get_monthly_costs_per_device(
+    month_str,
+    device_ids,
+    costs_file=DEFAULT_COSTS_FILE,
+    rent_file=DEFAULT_RENT_FILE,
+    rent_sheet=None,
+):
+    """
+    Wczytuje koszty z pliku Excel i rozdziela je na automaty.
+    Dla kosztów globalnych stosuje równy podział na wszystkie automaty AB.
+    """
+    normalized_ids = sorted({int(device_id) for device_id in device_ids})
+    if not normalized_ids:
+        return {}
+
+    default_entry = {
+        **{key: 0.0 for key in TVM_COST_KEYS},
+        **{key: 0.0 for key in OTHER_COST_KEYS},
+    }
+
+    if costs_file is None:
+        return {device_id: dict(default_entry) for device_id in normalized_ids}
+
+    costs_path = Path(costs_file)
+    if not costs_path.exists():
+        print(f"⚠ Brak pliku kosztów: {costs_path}")
+        return {device_id: dict(default_entry) for device_id in normalized_ids}
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(costs_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku kosztów: {e}")
+        return {device_id: dict(default_entry) for device_id in normalized_ids}
+
+    year_sheet = month_str.split('-')[0]
+    if year_sheet not in wb.sheetnames:
+        print(f"⚠ Brak arkusza {year_sheet} w pliku kosztów: {costs_path.name}")
+        return {device_id: dict(default_entry) for device_id in normalized_ids}
+
+    ws = wb[year_sheet]
+    global_costs = dict(default_entry)
+    rent_by_device = _load_rent_costs_by_device(
+        month_str,
+        rent_file=rent_file,
+        rent_sheet=rent_sheet,
+    )
+
+    # Koszty TVM (sekcje w kolumnie B)
+    global_costs['elavon'] = _extract_monthly_value_in_section(ws, 'ELAVON', month_str)
+    global_costs['poczta_polska'] = _extract_monthly_value_in_section(ws, 'POCZTA POLSKA', month_str)
+    global_costs['amortyzacja'] = _extract_monthly_value_in_section(ws, 'AMORTYZACJA', month_str)
+    global_costs['papier'] = _extract_monthly_value_in_section(ws, 'PAPIER', month_str)
+    global_costs['transmisja_danych'] = _extract_monthly_value_in_section(ws, 'TELEFONY/INTERNET', month_str)
+    global_costs['utrzymanie_oprogramowania'] = _extract_monthly_value_in_section(ws, 'NORDPLUS', month_str)
+    global_costs['ubezpieczenie'] = _extract_monthly_value_in_section(ws, 'UBEZPIECZENIE AUTOMATÓW', month_str)
+
+    serwis_label = 'SERWIS TERENOWY (AB, bez rPOS)'
+    serwis_row = _find_section_row(ws, serwis_label)
+    serwis_end_row = _get_section_end_row(ws, serwis_row)
+    serwis_glowny = _extract_monthly_value_in_section(ws, serwis_label, month_str)
+    serwis_szyszkowska = _extract_monthly_value_from_columns(
+        ws,
+        month_str,
+        month_col=9,
+        value_col=10,
+        start_row=(serwis_row + 1) if serwis_row else 1,
+        end_row=serwis_end_row,
+    )
+    serwis_zdankiewicz = _extract_monthly_value_from_columns(
+        ws,
+        month_str,
+        month_col=14,
+        value_col=15,
+        start_row=(serwis_row + 1) if serwis_row else 1,
+        end_row=serwis_end_row,
+    )
+    global_costs['serwis'] = serwis_glowny + serwis_szyszkowska + serwis_zdankiewicz
+
+    # Czynsz i prąd są pobierane per automat z pliku najmu.
+    global_costs['czynsz'] = 0.0
+    global_costs['prad'] = 0.0
+    global_costs['it_card'] = 0.0
+
+    # Other project costs
+    global_costs['non_tvm'] = _extract_monthly_value_from_header_table(
+        ws,
+        month_str,
+        header_label='Non TVMs',
+        month_col=9,
+        value_col=10,
+    )
+    global_costs['project_variable_costs'] = _extract_monthly_value_from_header_table(
+        ws,
+        month_str,
+        header_label='Project',
+        month_col=9,
+        value_col=11,
+    )
+    global_costs['oh'] = 0.0
+
+    device_count = len(normalized_ids)
+    costs_by_device = {}
+    for device_id in normalized_ids:
+        per_device = {}
+        for key, value in global_costs.items():
+            per_device[key] = float(value or 0.0) / device_count
+
+        rent_entry = rent_by_device.get(device_id, {})
+        per_device['czynsz'] = float(rent_entry.get('czynsz', 0.0) or 0.0)
+        per_device['prad'] = float(rent_entry.get('prad', 0.0) or 0.0)
+        costs_by_device[device_id] = per_device
+
+    return costs_by_device
+
+
 def get_monthly_revenue(
     conn,
     month_str,
@@ -1033,6 +1703,14 @@ def _resolve_transactions_amount_col_for_carrier(carrier_code, default_amount_co
     return TRANSACTIONS_AMOUNT_COL_OVERRIDES.get(normalized, default_amount_col)
 
 
+def _resolve_transactions_payment_method_col_for_carrier(carrier_code, default_payment_method_col):
+    """
+    Zwraca kolumnę metody płatności dla przewoźnika (string lub lista fallbacków).
+    """
+    normalized = str(carrier_code or '').strip().upper()
+    return TRANSACTIONS_PAYMENT_METHOD_COL_OVERRIDES.get(normalized, default_payment_method_col)
+
+
 def _preview_column_name(column_ref):
     """
     Zwraca nazwę kolumny do podglądu SQL (dla list fallbacków używa pierwszej pozycji).
@@ -1069,6 +1747,7 @@ def _resolve_transactions_source(
     amount_col,
     date_col,
     device_col=None,
+    payment_method_col=None,
 ):
     """
     Rozwiązuje źródło transakcji z jednego schematu.
@@ -1105,12 +1784,27 @@ def _resolve_transactions_source(
     if picked_device_col is None:
         return None
 
+    if payment_method_col:
+        if isinstance(payment_method_col, (list, tuple)):
+            picked_payment_method_col = _pick_first_matching_column(columns, list(payment_method_col))
+        else:
+            picked_payment_method_col = lowered_map.get(str(payment_method_col).lower())
+    else:
+        picked_payment_method_col = _pick_first_matching_column(
+            columns,
+            TRANSACTIONS_PAYMENT_METHOD_COL_CANDIDATES,
+        )
+
+    if picked_payment_method_col is None:
+        return None
+
     return {
         'schema': schema_name,
         'table': table_name,
         'device_col': picked_device_col,
         'amount_col': picked_amount_col,
         'date_col': picked_date_col,
+        'payment_method_col': picked_payment_method_col,
     }
 
 
@@ -1121,6 +1815,7 @@ def build_transactions_debug_query(
     amount_col=TRANSACTIONS_SOURCE_CONFIG['amount_col'],
     date_col=TRANSACTIONS_SOURCE_CONFIG['date_col'],
     device_col=TRANSACTIONS_SOURCE_CONFIG['device_col'],
+    payment_method_col=TRANSACTIONS_SOURCE_CONFIG['payment_method_col'],
 ):
     """
     Buduje gotowe zapytanie SQL diagnostyczne dla jednego schematu przewoźnika.
@@ -1128,6 +1823,7 @@ def build_transactions_debug_query(
     amount_col = _preview_column_name(amount_col)
     date_col = _preview_column_name(date_col)
     device_col = _preview_column_name(device_col)
+    payment_method_col = _preview_column_name(payment_method_col)
     start_date, end_date = get_month_range_closed(month_str)
     amount_expr = f"COALESCE({amount_col}, 0)"
     if amount_col.lower() in {'fin_nalezn', 'fin_ptu_kwota'}:
@@ -1135,15 +1831,17 @@ def build_transactions_debug_query(
     return f"""
 SELECT
     {device_col} AS device_id,
-    SUM({amount_expr}) AS obrot_brutto_zl,
+    {payment_method_col} AS fin_spos_opl,
+    SUM({amount_expr}) AS obrot_metoda_zl,
     COUNT(*) AS liczba_transakcji
 FROM {schema_name}.{table_name}
 WHERE {device_col}::text ~ '^[0-9]+$'
   AND (({device_col}::bigint BETWEEN 1101 AND 1141) OR ({device_col}::bigint BETWEEN 1201 AND 1299))
   AND {date_col} >= TIMESTAMP '{start_date.strftime('%Y-%m-%d %H:%M:%S')}'
   AND {date_col} <= TIMESTAMP '{end_date.strftime('%Y-%m-%d %H:%M:%S')}'
-GROUP BY {device_col}
-ORDER BY device_id;
+    AND {payment_method_col}::text IN ('1', '2', '6')
+GROUP BY {device_col}, {payment_method_col}
+ORDER BY device_id, {payment_method_col};
 """.strip()
 
 
@@ -1155,6 +1853,7 @@ def get_monthly_revenue_by_carrier(
     amount_col=TRANSACTIONS_SOURCE_CONFIG['amount_col'],
     date_col=TRANSACTIONS_SOURCE_CONFIG['date_col'],
     device_col=TRANSACTIONS_SOURCE_CONFIG['device_col'],
+    payment_method_col=TRANSACTIONS_SOURCE_CONFIG['payment_method_col'],
     use_device_range_filter=True,
 ):
     """
@@ -1164,7 +1863,12 @@ def get_monthly_revenue_by_carrier(
             'by_carrier': {
                 carrier: {
                     'obrot_brutto_zl': float,
-                    'liczba_transakcji': int
+                    'liczba_transakcji': int,
+                    'by_payment_method': {
+                        'gotowka': float,
+                        'karta': float,
+                        'blik': float,
+                    }
                 }
             }
         }
@@ -1180,6 +1884,10 @@ def get_monthly_revenue_by_carrier(
         carrier_table_name = _resolve_transactions_table_for_carrier(carrier_code, table_name)
         carrier_device_col = _resolve_transactions_device_col_for_carrier(carrier_code, device_col)
         carrier_amount_col = _resolve_transactions_amount_col_for_carrier(carrier_code, amount_col)
+        carrier_payment_method_col = _resolve_transactions_payment_method_col_for_carrier(
+            carrier_code,
+            payment_method_col,
+        )
         source = _resolve_transactions_source(
             conn,
             schema_name=carrier_code,
@@ -1187,12 +1895,13 @@ def get_monthly_revenue_by_carrier(
             amount_col=carrier_amount_col,
             date_col=date_col,
             device_col=carrier_device_col,
+            payment_method_col=carrier_payment_method_col,
         )
         if source is None:
             print(
                 f"⚠ Pomijam przewoźnika {carrier} (schemat {carrier_code}): "
                 f"brak źródła {carrier_code}.{carrier_table_name} lub wymaganych kolumn "
-                f"({carrier_device_col}, {date_col}, {carrier_amount_col})"
+                f"({carrier_device_col}, {date_col}, {carrier_amount_col}, {carrier_payment_method_col})"
             )
             continue
 
@@ -1213,15 +1922,17 @@ def get_monthly_revenue_by_carrier(
             """
             SELECT
                 {device_col} AS device_id,
-                SUM({amount_expr}) AS obrot_brutto_zl,
+                {payment_method_col} AS fin_spos_opl,
+                SUM({amount_expr}) AS obrot_metoda_zl,
                 COUNT(*) AS liczba_transakcji
             FROM {schema}.{table}
             WHERE {date_col} >= %s
                             AND {date_col} <= %s
                             {numeric_device_filter}
+              AND {payment_method_col}::text IN ('1', '2', '6')
               {device_filter}
-            GROUP BY {device_col}
-            ORDER BY device_id
+            GROUP BY {device_col}, {payment_method_col}
+            ORDER BY device_id, {payment_method_col}
             """
         ).format(
             schema=sql.Identifier(source['schema']),
@@ -1229,9 +1940,10 @@ def get_monthly_revenue_by_carrier(
             device_col=sql.Identifier(source['device_col']),
             amount_expr=_build_amount_expr_sql(source['amount_col']),
             date_col=sql.Identifier(source['date_col']),
+            payment_method_col=sql.Identifier(source['payment_method_col']),
             numeric_device_filter=numeric_device_sql,
             device_filter=device_filter_sql,
-        )
+         )
 
         cursor = conn.cursor()
         try:
@@ -1239,7 +1951,7 @@ def get_monthly_revenue_by_carrier(
             rows = cursor.fetchall()
             print(
                 f"✓ Obrót {carrier_code}: {source['schema']}.{source['table']} "
-                f"({source['device_col']}, {source['amount_col']}, {source['date_col']}) -> {len(rows)} automatów"
+                f"({source['device_col']}, {source['amount_col']}, {source['date_col']}, {source['payment_method_col']}) -> {len(rows)} rekordów"
             )
         except psycopg2.Error as e:
             print(f"⚠ Błąd pobierania obrotu dla {carrier_code}: {e}")
@@ -1248,19 +1960,38 @@ def get_monthly_revenue_by_carrier(
             cursor.close()
 
         for row in rows:
-            device_id, obrot, liczba = row
+            device_id, payment_method_value, obrot, liczba = row
             try:
                 device_id_int = int(device_id)
             except (TypeError, ValueError):
                 continue
 
-            revenue_data.setdefault(device_id_int, {'by_carrier': {}})
-            revenue_data[device_id_int]['by_carrier'][carrier_code] = {
-                'obrot_brutto_zl': float(obrot or 0.0),
-                'liczba_transakcji': int(liczba or 0),
-            }
+            method_key = PAYMENT_METHOD_CODE_TO_KEY.get(str(payment_method_value).strip())
+            if method_key is None:
+                continue
 
-        carrier_total = sum(float(r[1] or 0.0) for r in rows)
+            revenue_data.setdefault(device_id_int, {'by_carrier': {}})
+            carrier_entry = revenue_data[device_id_int]['by_carrier'].setdefault(
+                carrier_code,
+                {
+                    'obrot_brutto_zl': 0.0,
+                    'liczba_transakcji': 0,
+                    'by_payment_method': {key: 0.0 for key in PAYMENT_METHOD_KEYS},
+                },
+            )
+
+            method_amount = float(obrot or 0.0)
+            method_count = int(liczba or 0)
+            carrier_entry['by_payment_method'][method_key] += method_amount
+            carrier_entry['obrot_brutto_zl'] += method_amount
+            carrier_entry['liczba_transakcji'] += method_count
+
+        carrier_total = sum(
+            rev_entry.get('obrot_brutto_zl', 0.0)
+            for rev_device in revenue_data.values()
+            for code, rev_entry in rev_device.get('by_carrier', {}).items()
+            if code == carrier_code
+        )
         print(f"  Suma {carrier_code}: {carrier_total:,.2f} zł")
 
     return revenue_data
@@ -1276,10 +2007,16 @@ def export_to_excel_PL(
     commission_data=None,
     carriers=None,
     location_by_device=None,
+    automat_type_by_device=None,
+    costs_file=DEFAULT_COSTS_FILE,
+    rent_file=DEFAULT_RENT_FILE,
+    rent_sheet=None,
+    amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
+    amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
 ):
     """
     Eksportuje raport P&L do Excela.
-    Układ danych: jeden wiersz per automat, kolumny brutto per przewoźnik.
+    Układ danych: jeden wiersz per automat, kolumny brutto i metody płatności per przewoźnik.
     """
     if commission_data is None:
         commission_data = {}
@@ -1305,9 +2042,30 @@ def export_to_excel_PL(
     ws.title = f"P&L {month_str}"
     
     # === NAGŁÓWKI ===
-    headers = ['Nr aut.', 'Lokalizacja automatu']
-    headers.extend([f"Brutto {_display_carrier_label(code)}" for code in carrier_order])
+    headers = ['Nr aut.', 'Lokalizacja automatu', 'Typ automatu']
+    for code in carrier_order:
+        label = _display_carrier_label(code)
+        headers.append(f"Brutto {label}")
+        headers.append(f"Netto {label}")
+        headers.append(f"{PAYMENT_METHOD_LABELS['gotowka']} {label}")
+        headers.append(f"{PAYMENT_METHOD_LABELS['karta']} {label}")
+        headers.append(f"{PAYMENT_METHOD_LABELS['blik']} {label}")
     headers.append('Brutto Suma')
+    headers.append('Netto Suma')
+
+    for key in TVM_COST_KEYS:
+        headers.append(TVM_COST_LABELS[key])
+    headers.append('Koszty TVM Suma')
+
+    for key in OTHER_COST_KEYS:
+        headers.append(OTHER_COST_LABELS[key])
+    headers.append('TOTAL other project costs')
+    headers.append('SUMA KOSZTY')
+
+    headers.append('Karta Suma')
+    headers.append('BLIK Suma')
+    headers.append('Gotówka Suma')
+    headers.append('Transakcje bezgotówkowe')
     
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_num)
@@ -1319,11 +2077,28 @@ def export_to_excel_PL(
     # === DANE ===
     row_num = 2
     location_by_device = location_by_device or {}
+    automat_type_by_device = automat_type_by_device or {}
     # Upewnij się, że wszystkie klucze są integerami
     all_device_ids = sorted(set(
         [int(k) for k in dictionary_comparison.keys()] + 
         [int(k) for k in revenue_data.keys()]
     ))
+    costs_by_device = _get_monthly_costs_per_device(
+        month_str,
+        all_device_ids,
+        costs_file=costs_file,
+        rent_file=rent_file,
+        rent_sheet=rent_sheet,
+    )
+    bb_amort_sources = _load_bb_amortyzacja_sources(
+        month_str,
+        amortyzacja_file=amortyzacja_file,
+        amortyzacja_sheet=amortyzacja_sheet,
+    )
+    bb_type_count = 0
+    bb_matched_by_location = 0
+    bb_matched_by_nr = 0
+    bb_missing = 0
     
     for device_id in all_device_ids:
         # 1-INFO (najpierw mapa lokalizacji zebrana po przewoźnikach)
@@ -1344,21 +2119,115 @@ def export_to_excel_PL(
 
         ws.cell(row=row_num, column=1).value = device_id
         ws.cell(row=row_num, column=2).value = lokalizacja
+        automat_type = str(automat_type_by_device.get(device_id, '') or '').strip().upper()
+        ws.cell(row=row_num, column=3).value = automat_type
 
         row_total = 0.0
-        for idx, carrier_code in enumerate(carrier_order, start=3):
+        row_netto_total = 0.0
+        cash_total = 0.0
+        card_total = 0.0
+        blik_total = 0.0
+        col_idx = 4
+        for carrier_code in carrier_order:
             rev = rev_by_carrier.get(carrier_code)
             amount = 0.0
+            netto_amount = 0.0
+            by_payment_method = {key: 0.0 for key in PAYMENT_METHOD_KEYS}
             if isinstance(rev, dict):
                 amount = float(rev.get('obrot_brutto_zl', 0.0) or 0.0)
-            ws.cell(row=row_num, column=idx).value = amount
-            ws.cell(row=row_num, column=idx).number_format = '#,##0.00'
-            row_total += amount
+                method_values = rev.get('by_payment_method')
+                if isinstance(method_values, dict):
+                    for method_key in PAYMENT_METHOD_KEYS:
+                        by_payment_method[method_key] = float(method_values.get(method_key, 0.0) or 0.0)
+            netto_amount = amount / 1.08
 
-        total_col = 3 + len(carrier_order)
+            cash_total += by_payment_method['gotowka']
+            card_total += by_payment_method['karta']
+            blik_total += by_payment_method['blik']
+
+            ws.cell(row=row_num, column=col_idx).value = amount
+            ws.cell(row=row_num, column=col_idx).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=col_idx + 1).value = netto_amount
+            ws.cell(row=row_num, column=col_idx + 1).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=col_idx + 2).value = by_payment_method['gotowka']
+            ws.cell(row=row_num, column=col_idx + 2).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=col_idx + 3).value = by_payment_method['karta']
+            ws.cell(row=row_num, column=col_idx + 3).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=col_idx + 4).value = by_payment_method['blik']
+            ws.cell(row=row_num, column=col_idx + 4).number_format = '#,##0.00'
+            row_total += amount
+            row_netto_total += netto_amount
+
+            col_idx += 5
+
+        total_col = col_idx
         ws.cell(row=row_num, column=total_col).value = row_total
         ws.cell(row=row_num, column=total_col).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=total_col + 1).value = row_netto_total
+        ws.cell(row=row_num, column=total_col + 1).number_format = '#,##0.00'
+
+        cost_entry = dict(costs_by_device.get(device_id, {}))
+        if automat_type == 'BB':
+            bb_type_count += 1
+            normalized_location = _normalize_text_for_match(lokalizacja)
+            if normalized_location and normalized_location in bb_amort_sources['by_location']:
+                cost_entry['amortyzacja'] = float(bb_amort_sources['by_location'][normalized_location] or 0.0)
+                bb_matched_by_location += 1
+            elif device_id in bb_amort_sources['by_nr_inw']:
+                cost_entry['amortyzacja'] = float(bb_amort_sources['by_nr_inw'][device_id] or 0.0)
+                bb_matched_by_nr += 1
+            else:
+                cost_entry['amortyzacja'] = 0.0
+                bb_missing += 1
+
+        costs_col = total_col + 2
+        tvm_cost_sum = 0.0
+        for key in TVM_COST_KEYS:
+            val = float(cost_entry.get(key, 0.0) or 0.0)
+            tvm_cost_sum += val
+            ws.cell(row=row_num, column=costs_col).value = val
+            ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
+            costs_col += 1
+
+        ws.cell(row=row_num, column=costs_col).value = tvm_cost_sum
+        ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
+        costs_col += 1
+
+        non_tvm_val = float(cost_entry.get('non_tvm', 0.0) or 0.0)
+        project_val = float(cost_entry.get('project_variable_costs', 0.0) or 0.0)
+        oh_val = float(cost_entry.get('oh', 0.0) or 0.0)
+        other_total = non_tvm_val + project_val + oh_val
+        all_costs_total = tvm_cost_sum + other_total
+
+        ws.cell(row=row_num, column=costs_col).value = non_tvm_val
+        ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 1).value = project_val
+        ws.cell(row=row_num, column=costs_col + 1).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 2).value = oh_val
+        ws.cell(row=row_num, column=costs_col + 2).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 3).value = other_total
+        ws.cell(row=row_num, column=costs_col + 3).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 4).value = all_costs_total
+        ws.cell(row=row_num, column=costs_col + 4).number_format = '#,##0.00'
+
+        ws.cell(row=row_num, column=costs_col + 5).value = card_total
+        ws.cell(row=row_num, column=costs_col + 5).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 6).value = blik_total
+        ws.cell(row=row_num, column=costs_col + 6).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 7).value = cash_total
+        ws.cell(row=row_num, column=costs_col + 7).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + 8).value = card_total + blik_total
+        ws.cell(row=row_num, column=costs_col + 8).number_format = '#,##0.00'
         row_num += 1
+
+    if bb_type_count:
+        print(
+            "✓ Amortyzacja BB: "
+            f"typ BB={bb_type_count}, "
+            f"po Nazwa={bb_matched_by_location}, "
+            f"po Nr.inw={bb_matched_by_nr}, "
+            f"braki={bb_missing}"
+        )
     
     # Dostosuj szerokość kolumn
     for col in ws.columns:
@@ -1416,7 +2285,7 @@ def main():
         '--obrot-carriers',
         nargs='*',
         default=CARRIERS,
-        help='Lista przewoźników/schematów do pobrania (np. ARP IC KD KM KML KW LKA PR SKM)'
+        help='Lista przewoźników/schematów do pobrania (np. ARP IC KD KML KW LKA PR SKM)'
     )
     parser.add_argument(
         '--obrot-transactions-table',
@@ -1441,6 +2310,12 @@ def main():
         type=str,
         default=TRANSACTIONS_SOURCE_CONFIG['device_col'],
         help='Kolumna numeru automatu (domyślnie: tvm_tvm_id)'
+    )
+    parser.add_argument(
+        '--obrot-transactions-payment-method-col',
+        type=str,
+        default=TRANSACTIONS_SOURCE_CONFIG['payment_method_col'],
+        help='Kolumna metody płatności (domyślnie: fin_spos_opl)'
     )
     parser.add_argument(
         '--obrot-print-sql',
@@ -1484,6 +2359,36 @@ def main():
         help='Ścieżka do pliku .xls z raportu PROVISION (single sheet) do porównania'
     )
     parser.add_argument(
+        '--koszty-file',
+        type=str,
+        default=str(DEFAULT_COSTS_FILE),
+        help='Ścieżka do pliku Excel z kosztami projektu'
+    )
+    parser.add_argument(
+        '--najem-file',
+        type=str,
+        default=str(DEFAULT_RENT_FILE),
+        help='Ścieżka do pliku Excel z czynszem i energią per automat'
+    )
+    parser.add_argument(
+        '--najem-sheet',
+        type=str,
+        default=None,
+        help='Nazwa arkusza z najmem (domyślnie: rok z --miesiac)'
+    )
+    parser.add_argument(
+        '--amortyzacja-file',
+        type=str,
+        default=str(DEFAULT_AMORTYZACJA_FILE),
+        help='Ścieżka do pliku z amortyzacją miesięczną automatów'
+    )
+    parser.add_argument(
+        '--amortyzacja-sheet',
+        type=str,
+        default=DEFAULT_AMORTYZACJA_SHEET,
+        help='Nazwa arkusza z amortyzacją BB (domyślnie: bb8)'
+    )
+    parser.add_argument(
         '--output-naming',
         choices=['default', 'monitor-style'],
         default='default',
@@ -1496,6 +2401,22 @@ def main():
     )
     parser.set_defaults(strict_prowizja_month_window=True)
     args = parser.parse_args()
+
+    normalized_carriers = []
+    for carrier in args.obrot_carriers or []:
+        code = _normalize_carrier_code(carrier)
+        if not code:
+            continue
+        if code not in normalized_carriers:
+            normalized_carriers.append(code)
+
+    disallowed = sorted(code for code in normalized_carriers if code in DISALLOWED_CARRIERS)
+    if disallowed:
+        parser.error(
+            f"Przewoźnik(i) niedozwoleni: {', '.join(disallowed)}. "
+            f"Dozwolone wartości: {', '.join(CARRIERS)}"
+        )
+    args.obrot_carriers = normalized_carriers
     
     # Określ miesiąc raportowy
     if args.miesiac:
@@ -1616,13 +2537,18 @@ def main():
                     carrier_code,
                     args.obrot_transactions_amount_col,
                 )
+                carrier_payment_method_col = _resolve_transactions_payment_method_col_for_carrier(
+                    carrier_code,
+                    args.obrot_transactions_payment_method_col,
+                )
                 sql_preview = build_transactions_debug_query(
                     schema_name=carrier_code,
                     month_str=month_str,
-                    table_name=carrier_table_name,
+                    table_name=carrier_table_name or args.obrot_transactions_table,
                     amount_col=carrier_amount_col,
                     date_col=args.obrot_transactions_date_col,
-                    device_col=carrier_device_col,
+                    device_col=_preview_column_name(carrier_device_col) or args.obrot_transactions_device_col,
+                    payment_method_col=_preview_column_name(carrier_payment_method_col) or args.obrot_transactions_payment_method_col,
                 )
                 print(
                     f"\n--- {carrier} (schema: {carrier_code}, table: {carrier_table_name}) ---\n"
@@ -1637,6 +2563,7 @@ def main():
             amount_col=args.obrot_transactions_amount_col,
             date_col=args.obrot_transactions_date_col,
             device_col=args.obrot_transactions_device_col,
+            payment_method_col=args.obrot_transactions_payment_method_col,
             use_device_range_filter=not args.obrot_no_device_range_filter,
         )
 
@@ -1711,6 +2638,16 @@ def main():
     )
     print(f"✓ Uzupełniono lokalizacje dla {len(location_by_device)} / {len(all_device_ids)} automatów")
 
+    automat_type_by_device = get_automat_type_by_device_from_av(
+        conn,
+        all_device_ids,
+        schema_name='AV',
+        table_name='dictionary',
+        value_col='value',
+        groupid_col='groupid',
+    )
+    print(f"✓ Uzupełniono typ automatu dla {len(automat_type_by_device)} / {len(all_device_ids)} automatów")
+
     conn.close()
 
     # === KROK 5: Eksport do Excel ===
@@ -1724,11 +2661,17 @@ def main():
         commission_data=commission_data,
         carriers=args.obrot_carriers,
         location_by_device=location_by_device,
+        automat_type_by_device=automat_type_by_device,
+        costs_file=args.koszty_file,
+        rent_file=args.najem_file,
+        rent_sheet=args.najem_sheet,
+        amortyzacja_file=args.amortyzacja_file,
+        amortyzacja_sheet=args.amortyzacja_sheet,
     )
     
     print(f"\n{'='*60}")
     print(f"  ✓ RAPORT ZAKOŃCZONY POMYŚLNIE")
-    print("  Układ: jeden wiersz na automat, kolumny brutto per przewoźnik + Brutto Suma")
+    print("  Układ: jeden wiersz na automat, obrót per przewoźnik + sekcja kosztów TVM/Other + SUMA KOSZTY")
     print("  Braki danych per przewoźnik są wpisywane jako 0")
     print(f"{'='*60}\n")
 
