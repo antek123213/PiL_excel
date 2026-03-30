@@ -3,7 +3,9 @@ import psycopg2
 from psycopg2 import sql
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
-from datetime import datetime
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.utils import get_column_letter
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
 import json
 import argparse
@@ -11,13 +13,17 @@ import time
 from pathlib import Path
 import re
 import calendar
+import unicodedata
+import os
+import sys
 
 
 def _silent_print(*args, **kwargs):
     return None
 
 
-print = _silent_print
+if os.environ.get('PIL_SILENT', '').strip() == '1':
+    print = _silent_print
 
 # === KONFIGURACJA ===
 DB_CONFIG = {
@@ -36,6 +42,7 @@ OUTPUT_DIR = Path(__file__).parent / 'output'
 DEFAULT_COSTS_FILE = Path(__file__).parent / 'P&L_2025.11.25_koszty_ROP 2025.xlsx'
 DEFAULT_RENT_FILE = Path(__file__).parent / 'Najem powierzchni 2025-2026.xlsx'
 DEFAULT_AMORTYZACJA_FILE = Path(__file__).parent / 'Amortyzacja miesieczna Automaty.xlsx'
+DEFAULT_PROWIZJE_FILE = Path(__file__).parent / 'Prowizje_AB.xlsx'
 DEFAULT_AMORTYZACJA_SHEET = 'bb8'
 DEVICE_ID_RANGES = (
     (1101, 1141),
@@ -79,6 +86,14 @@ PAYMENT_METHOD_LABELS = {
     'karta': 'Karta',
     'blik': 'BLIK',
 }
+IT_CARD_RATE_BY_CARRIER = {
+    'KD': 0.0154,
+    'KML': 0.0135,
+    'LKA': 0.0154,
+    'ARP': 0.0154,
+    'PR': 0.0154,
+}
+DEFAULT_IT_CARD_RATE = 0.0154
 TVM_COST_KEYS = (
     'czynsz',
     'prad',
@@ -105,10 +120,11 @@ TVM_COST_LABELS = {
     'it_card': 'IT card',
     'ubezpieczenie': 'ubezpieczenie',
 }
-OTHER_COST_KEYS = ('non_tvm', 'project_variable_costs', 'oh')
+OTHER_COST_KEYS = ('non_tvm', 'project_variable_costs', 'zdankiewicz', 'oh')
 OTHER_COST_LABELS = {
     'non_tvm': 'NON TVM',
     'project_variable_costs': 'Project Variable Costs',
+    'zdankiewicz': 'Zdankiewicz najklejki',
     'oh': 'OH',
 }
 TRANSACTIONS_DEVICE_COL_CANDIDATES = [
@@ -1023,16 +1039,99 @@ def validate_provision_sql_vs_xls(conn, month_str, commission_source, xls_path, 
     return comparison, exit_code
 
 
-def _as_float(value):
+def _has_nonempty_value(value):
     """
-    Konwertuje wartość na float. Zwraca 0.0 dla pustych/nienumerycznych.
+    Sprawdza, czy wartość jest niepusta z perspektywy odczytu z Excela.
     """
     if value is None:
+        return False
+    return bool(str(value).strip())
+
+
+def _as_float(value, as_percent=False):
+    """
+    Konwertuje wartość z Excela na float.
+
+    Obsługuje m.in. polski zapis dziesiętny, separatory tysięcy,
+    symbole walut i zapis procentowy.
+    Dla as_percent=True zwraca ułamek (np. 2% -> 0.02, 2 -> 0.02).
+    """
+    if value is None or isinstance(value, bool):
         return 0.0
+
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if not as_percent:
+            return numeric
+        if abs(numeric) <= 1.0:
+            return numeric
+        return numeric / 100.0
+
+    text = str(value).strip()
+    if not text:
+        return 0.0
+
+    text = (
+        text
+        .replace('\xa0', ' ')
+        .replace('\u202f', ' ')
+        .replace('\u2009', ' ')
+        .replace('−', '-')
+        .replace('–', '-')
+        .replace('—', '-')
+    )
+
+    is_parentheses_negative = text.startswith('(') and text.endswith(')')
+    if is_parentheses_negative:
+        text = text[1:-1].strip()
+
+    has_percent = '%' in text
+    text = re.sub(r'(?i)\b(PLN|ZL|ZŁ|EUR|USD)\b', '', text)
+    text = text.replace('%', '')
+    text = text.replace(' ', '')
+    text = text.replace("'", '')
+
+    text = re.sub(r'[^0-9,\.\-]', '', text)
+    if not text or text in ('-', '--'):
+        return 0.0
+
+    if text.startswith('-'):
+        text = '-' + text[1:].replace('-', '')
+    else:
+        text = text.replace('-', '')
+
+    if ',' in text and '.' in text:
+        if text.rfind(',') > text.rfind('.'):
+            text = text.replace('.', '')
+            text = text.replace(',', '.')
+        else:
+            text = text.replace(',', '')
+    elif ',' in text:
+        if text.count(',') == 1:
+            text = text.replace(',', '.')
+        else:
+            parts = text.split(',')
+            text = ''.join(parts[:-1]) + '.' + parts[-1]
+    elif text.count('.') > 1:
+        parts = text.split('.')
+        text = ''.join(parts[:-1]) + '.' + parts[-1]
+
     try:
-        return float(value)
+        numeric = float(text)
     except (TypeError, ValueError):
         return 0.0
+
+    if is_parentheses_negative and numeric > 0:
+        numeric = -numeric
+
+    if not as_percent:
+        return numeric
+
+    if has_percent:
+        return numeric / 100.0
+    if abs(numeric) <= 1.0:
+        return numeric
+    return numeric / 100.0
 
 
 def _matches_month(value, month_str):
@@ -1192,6 +1291,374 @@ def _parse_device_id(value):
     if re.fullmatch(r'\d+(\.0+)?', text):
         return int(float(text))
     return None
+
+
+def _as_date(value):
+    """
+    Konwertuje wartość do date; zwraca None gdy brak poprawnej daty.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if hasattr(value, 'date'):
+        return value.date()
+    return None
+
+
+def _month_date_bounds(month_str):
+    """
+    Zwraca zakres dat miesiąca raportowego jako date (start, end).
+    """
+    start_dt, end_dt = get_month_range_closed(month_str)
+    return start_dt.date(), end_dt.date()
+
+
+def _normalize_excel_commission_header(value):
+    """
+    Normalizuje nagłówek kolumny arkusza prowizji do porównań.
+    """
+    if value is None:
+        return ''
+    text = str(value).strip().upper()
+    text = unicodedata.normalize('NFKD', text)
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return re.sub(r'[^A-Z0-9]+', '', text)
+
+
+def _find_header_col(row_map, predicate):
+    """
+    Zwraca indeks kolumny dla pierwszego nagłówka spełniającego warunek.
+    """
+    for key, col in row_map.items():
+        if predicate(key):
+            return col
+    return None
+
+
+def _pick_commission_rules_for_month(rules, month_start, month_end):
+    """
+    Wybiera najtrafniejsze rekordy prowizji dla miesiąca.
+
+    Najpierw filtruje reguły nachodzące na miesiąc raportowy,
+    a następnie bierze komplet rekordów z "najlepszego" okna:
+    najpóźniejsze valid_from i (w tym zbiorze) najpóźniejsze valid_to.
+
+    Dzięki temu jeżeli ryczałt i procent są zapisane w osobnych wierszach
+    dla tego samego okresu, oba składniki są uwzględnione.
+    """
+    if not rules:
+        return []
+
+    matched = []
+    for rule in rules:
+        valid_from = rule.get('valid_from')
+        valid_to = rule.get('valid_to')
+        if valid_from is None or valid_to is None:
+            continue
+        if valid_from <= month_end and valid_to >= month_start:
+            matched.append(rule)
+
+    if not matched:
+        return []
+
+    best_valid_from = max((r.get('valid_from') or date.min) for r in matched)
+    best_from_rules = [
+        r for r in matched
+        if (r.get('valid_from') or date.min) == best_valid_from
+    ]
+    best_valid_to = max((r.get('valid_to') or date.min) for r in best_from_rules)
+
+    return [
+        r for r in best_from_rules
+        if (r.get('valid_to') or date.min) == best_valid_to
+    ]
+
+
+def _commission_amount_from_rule(rule, net_amount):
+    """
+    Wylicza prowizję dla jednej reguły i kwoty netto.
+    """
+    if not rule:
+        return 0.0
+
+    fixed_amount = float(rule.get('fixed_amount', 0.0) or 0.0)
+    percent = float(rule.get('percent', 0.0) or 0.0)
+    percent_amount = 0.0
+    if percent > 0:
+        percent_amount = float(net_amount or 0.0) * percent
+    return max(fixed_amount, 0.0) + percent_amount
+
+
+def _commission_amount_from_rules(rules, net_amount):
+    """
+    Sumuje prowizję ze wszystkich przekazanych reguł.
+    """
+    if not rules:
+        return 0.0
+    return sum(_commission_amount_from_rule(rule, net_amount) for rule in rules)
+
+def build_monthly_commission_data_from_rules(revenue_data, commission_rules, month_str):
+    """
+    Buduje agregat prowizji per automat na podstawie reguł z pliku prowizji
+    i obrotu per przewoźnik.
+
+    Zwraca format zgodny z compare_commission_with_reference:
+      {device_id: {'prowizja_zl': float, 'liczba_rekordow': int}}
+    """
+    month_start, month_end = _month_date_bounds(month_str)
+    commission_data = {}
+    missing_rules = 0
+    missing_samples = []
+
+    for device_id, rev_entry in (revenue_data or {}).items():
+        if not isinstance(rev_entry, dict):
+            continue
+        by_carrier = rev_entry.get('by_carrier', {})
+        if not isinstance(by_carrier, dict):
+            continue
+
+        device_id_int = int(device_id)
+        total_device_commission = 0.0
+        matched_records = 0
+
+        for carrier_code, carrier_entry in by_carrier.items():
+            gross_amount = 0.0
+            net_amount = 0.0
+            if isinstance(carrier_entry, dict):
+                gross_amount = float(carrier_entry.get('obrot_brutto_zl', 0.0) or 0.0)
+                net_amount = gross_amount / 1.08
+
+            rules_for_key = commission_rules.get((device_id_int, carrier_code), [])
+            picked_rules = _pick_commission_rules_for_month(rules_for_key, month_start, month_end)
+            if picked_rules:
+                matched_records += 1
+            else:
+                missing_rules += 1
+                if len(missing_samples) < 8:
+                    missing_samples.append((device_id_int, carrier_code))
+
+            total_device_commission += _commission_amount_from_rules(picked_rules, net_amount)
+
+        commission_data[device_id_int] = {
+            'prowizja_zl': float(total_device_commission),
+            'liczba_rekordow': int(matched_records),
+        }
+
+    if missing_rules:
+        print(f"⚠ Brak dopasowanej reguły prowizji dla {missing_rules} par (automat, przewoźnik)")
+        if missing_samples:
+            print(f"  Przykłady braków: {missing_samples}")
+
+    return commission_data
+
+
+def load_commission_rules_and_locations_from_xlsx(month_str, commission_file=DEFAULT_PROWIZJE_FILE):
+    """
+    Wczytuje reguły prowizji i lokalizacje z pliku Prowizje_AB.xlsx.
+    Zwraca:
+      - commission_rules: {(device_id, carrier_code): [rule, ...]}
+      - location_by_device: {device_id: location}
+    """
+    commission_path = Path(commission_file)
+    if not commission_path.exists():
+        print(f"⚠ Brak pliku prowizji: {commission_path}")
+        return {}, {}
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(commission_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku prowizji: {e}")
+        return {}, {}
+
+    if not wb.sheetnames:
+        return {}, {}
+
+    ws = wb[wb.sheetnames[0]]
+    header_row = None
+    header_map = {}
+
+    scan_to = min(ws.max_row, 40)
+    for r in range(1, scan_to + 1):
+        row_map = {}
+        for c in range(1, ws.max_column + 1):
+            token = _normalize_excel_commission_header(ws.cell(r, c).value)
+            if not token:
+                continue
+            row_map[token] = c
+
+        if not row_map:
+            continue
+
+        carrier_col = _find_header_col(row_map, lambda k: 'PRZEWOZNIK' in k)
+        device_col = _find_header_col(row_map, lambda k: 'NUMERAUTOMATU' in k)
+        valid_from_col = _find_header_col(
+            row_map,
+            lambda k: (
+                'WAZNOSCOD' in k
+                or 'WANOOD' in k
+                or (k.startswith('WA') and k.endswith('OD'))
+            ),
+        )
+        valid_to_col = _find_header_col(
+            row_map,
+            lambda k: (
+                'WAZNOSCDO' in k
+                or 'WANODO' in k
+                or (k.startswith('WA') and k.endswith('DO'))
+            ),
+        )
+        fixed_col = _find_header_col(
+            row_map,
+            lambda k: (
+                'RYCZALT' in k
+                or 'RYCZAT' in k
+                or 'STALA' in k
+                or 'KWOTOWA' in k
+            ),
+        )
+        percent_col = _find_header_col(row_map, lambda k: 'PROCENTOWA' in k or 'PROCENT' in k)
+        location_col = _find_header_col(row_map, lambda k: 'TVMLOCATION1' in k)
+
+        if carrier_col and device_col and valid_from_col and valid_to_col and (fixed_col or percent_col):
+            header_row = r
+            header_map = {
+                'carrier_col': carrier_col,
+                'device_col': device_col,
+                'valid_from_col': valid_from_col,
+                'valid_to_col': valid_to_col,
+                'fixed_col': fixed_col,
+                'percent_col': percent_col,
+                'location_col': location_col,
+            }
+            break
+
+    if header_row is None:
+        print("⚠ Nie znaleziono wymaganych kolumn w pliku prowizji")
+        return {}, {}
+
+    commission_rules = {}
+    location_by_device = {}
+    month_start, month_end = _month_date_bounds(month_str)
+    invalid_date_ranges = 0
+    skipped_missing_required = 0
+    skipped_zero_after_parse = 0
+    fixed_only_rules = 0
+    percent_only_rules = 0
+    mixed_rules = 0
+    parse_to_zero_fixed = 0
+    parse_to_zero_percent = 0
+    parse_to_zero_samples = []
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        raw_carrier = ws.cell(r, header_map['carrier_col']).value
+        raw_device = ws.cell(r, header_map['device_col']).value
+        raw_from = ws.cell(r, header_map['valid_from_col']).value
+        raw_to = ws.cell(r, header_map['valid_to_col']).value
+
+        if raw_carrier is None and raw_device is None and raw_from is None and raw_to is None:
+            continue
+
+        carrier_code = _normalize_carrier_code(raw_carrier)
+        device_id = _parse_device_id(raw_device)
+        valid_from = _as_date(raw_from)
+        valid_to = _as_date(raw_to)
+
+        if not carrier_code or device_id is None or valid_from is None or valid_to is None:
+            skipped_missing_required += 1
+            continue
+
+        if valid_from > valid_to:
+            invalid_date_ranges += 1
+            continue
+
+        fixed_amount = 0.0
+        percent = 0.0
+        raw_fixed = None
+        raw_percent = None
+        if header_map.get('fixed_col'):
+            raw_fixed = ws.cell(r, header_map['fixed_col']).value
+            fixed_amount = _as_float(raw_fixed)
+        if header_map.get('percent_col'):
+            raw_percent = ws.cell(r, header_map['percent_col']).value
+            percent = _as_float(raw_percent, as_percent=True)
+
+        if _has_nonempty_value(raw_fixed) and fixed_amount == 0.0 and re.search(r'[1-9]', str(raw_fixed)):
+            parse_to_zero_fixed += 1
+            if len(parse_to_zero_samples) < 8:
+                parse_to_zero_samples.append((r, 'fixed', str(raw_fixed)))
+
+        if _has_nonempty_value(raw_percent) and percent == 0.0 and re.search(r'[1-9]', str(raw_percent)):
+            parse_to_zero_percent += 1
+            if len(parse_to_zero_samples) < 8:
+                parse_to_zero_samples.append((r, 'percent', str(raw_percent)))
+
+        if fixed_amount <= 0.0 and percent <= 0.0:
+            skipped_zero_after_parse += 1
+            continue
+
+        if fixed_amount > 0.0 and percent > 0.0:
+            mixed_rules += 1
+        elif fixed_amount > 0.0:
+            fixed_only_rules += 1
+        else:
+            percent_only_rules += 1
+
+        key = (int(device_id), carrier_code)
+        commission_rules.setdefault(key, []).append({
+            'valid_from': valid_from,
+            'valid_to': valid_to,
+            'fixed_amount': fixed_amount,
+            'percent': percent,
+        })
+
+        raw_location = ws.cell(r, header_map['location_col']).value if header_map.get('location_col') else None
+        normalized_location = _normalize_tvm_location_text(raw_location)
+        if (
+            normalized_location
+            and int(device_id) not in location_by_device
+            and valid_from <= month_end
+            and valid_to >= month_start
+        ):
+            location_by_device[int(device_id)] = normalized_location
+
+    if invalid_date_ranges:
+        print(
+            f"⚠ Pominięto {invalid_date_ranges} wierszy prowizji z nieprawidłowym zakresem dat (od > do)"
+        )
+    if skipped_missing_required:
+        print(
+            f"⚠ Pominięto {skipped_missing_required} wierszy prowizji z brakiem wymaganych danych "
+            "(przewoźnik/automat/daty)"
+        )
+    if skipped_zero_after_parse:
+        print(
+            f"⚠ Pominięto {skipped_zero_after_parse} wierszy prowizji, bo ryczałt i procent wyszły jako 0"
+        )
+
+    parse_to_zero_total = parse_to_zero_fixed + parse_to_zero_percent
+    if parse_to_zero_total:
+        print(
+            "⚠ Podejrzane parse-to-zero w prowizjach: "
+            f"fixed={parse_to_zero_fixed}, percent={parse_to_zero_percent}"
+        )
+        if parse_to_zero_samples:
+            print(f"  Przykłady parse-to-zero: {parse_to_zero_samples}")
+
+    print(
+        "✓ Typy reguł prowizji: "
+        f"ryczałt={fixed_only_rules}, "
+        f"procent={percent_only_rules}, "
+        f"mieszane={mixed_rules}"
+    )
+    loaded_carriers = sorted({carrier for _, carrier in commission_rules.keys()})
+    if loaded_carriers:
+        print(f"✓ Przewoźnicy w regułach prowizji: {loaded_carriers}")
+
+    return commission_rules, location_by_device
 
 
 def _build_month_header_targets(month_str):
@@ -1361,96 +1828,116 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
         print(f"⚠ Brak arkusza {sheet_name} w pliku najmu: {rent_path.name}")
         return {}
 
-    ws = wb[sheet_name]
-    month_label_slash, month_label_compact = _build_month_year_labels(month_str)
+    try:
+        ws = wb[sheet_name]
+        month_label_slash, month_label_compact = _build_month_year_labels(month_str)
 
-    header_row = None
-    device_col = None
-    czynsz_col = None
-    prad_col = None
+        header_row = None
+        device_col = None
+        czynsz_col = None
+        prad_col = None
 
-    czynsz_targets = {
-        _normalize_header_text(f"Czynsz {month_label_slash}"),
-        _normalize_header_text(f"Czynsz{month_label_slash}"),
-        _normalize_header_text(f"Czynsz {month_label_compact}"),
-        _normalize_header_text(f"Czynsz{month_label_compact}"),
-    }
-    prad_targets = {
-        _normalize_header_text(f"Energia {month_label_slash}"),
-        _normalize_header_text(f"Energia{month_label_slash}"),
-        _normalize_header_text(f"Energia {month_label_compact}"),
-        _normalize_header_text(f"Energia{month_label_compact}"),
-        _normalize_header_text(f"Prad {month_label_slash}"),
-        _normalize_header_text(f"Prad{month_label_slash}"),
-        _normalize_header_text(f"Prad {month_label_compact}"),
-        _normalize_header_text(f"Prad{month_label_compact}"),
-    }
-
-    scan_to = min(ws.max_row, 60)
-    for r in range(1, scan_to + 1):
-        row_device_col = None
-        row_czynsz_col = None
-        row_prad_col = None
-
-        for c in range(1, ws.max_column + 1):
-            raw_header = ws.cell(r, c).value
-            normalized_header = _normalize_header_text(raw_header)
-            if not normalized_header:
-                continue
-
-            if normalized_header == 'NRAUTOMATU':
-                row_device_col = c
-            if normalized_header in czynsz_targets:
-                row_czynsz_col = c
-            if normalized_header in prad_targets:
-                row_prad_col = c
-
-        if row_device_col and row_czynsz_col and row_prad_col:
-            header_row = r
-            device_col = row_device_col
-            czynsz_col = row_czynsz_col
-            prad_col = row_prad_col
-            break
-
-    if header_row is None:
-        print(
-            "⚠ Nie znaleziono wymaganych kolumn najmu: "
-            f"Nr.automatu, Czynsz {month_label_slash}, Energia {month_label_slash}"
-        )
-        return {}
-
-    if device_col is None or czynsz_col is None or prad_col is None:
-        print("⚠ Niekompletna konfiguracja kolumn najmu")
-        return {}
-
-    device_col = int(device_col)
-    czynsz_col = int(czynsz_col)
-    prad_col = int(prad_col)
-
-    rent_map = {}
-    skipped_rows = 0
-    for r in range(header_row + 1, ws.max_row + 1):
-        raw_device = ws.cell(r, device_col).value
-        raw_czynsz = ws.cell(r, czynsz_col).value
-        raw_prad = ws.cell(r, prad_col).value
-
-        if raw_device is None and raw_czynsz is None and raw_prad is None:
-            continue
-
-        device_id = _parse_device_id(raw_device)
-        if device_id is None:
-            skipped_rows += 1
-            continue
-
-        rent_map[device_id] = {
-            'czynsz': _as_float(raw_czynsz),
-            'prad': _as_float(raw_prad),
+        czynsz_targets = {
+            _normalize_header_text(f"Czynsz {month_label_slash}"),
+            _normalize_header_text(f"Czynsz{month_label_slash}"),
+            _normalize_header_text(f"Czynsz {month_label_compact}"),
+            _normalize_header_text(f"Czynsz{month_label_compact}"),
+        }
+        prad_targets = {
+            _normalize_header_text(f"Energia {month_label_slash}"),
+            _normalize_header_text(f"Energia{month_label_slash}"),
+            _normalize_header_text(f"Energia {month_label_compact}"),
+            _normalize_header_text(f"Energia{month_label_compact}"),
+            _normalize_header_text(f"Prad {month_label_slash}"),
+            _normalize_header_text(f"Prad{month_label_slash}"),
+            _normalize_header_text(f"Prad {month_label_compact}"),
+            _normalize_header_text(f"Prad{month_label_compact}"),
         }
 
-    if skipped_rows:
-        print(f"⚠ Pominięto {skipped_rows} wierszy najmu z nieprawidłowym Nr.automatu")
+        scan_to = min(ws.max_row, 60)
+        for r, row_values in enumerate(
+            ws.iter_rows(min_row=1, max_row=scan_to, values_only=True),
+            start=1,
+        ):
+            row_device_col = None
+            row_czynsz_col = None
+            row_prad_col = None
 
-    return rent_map
+            for c, raw_header in enumerate(row_values, start=1):
+                normalized_header = _normalize_header_text(raw_header)
+                if not normalized_header:
+                    continue
+
+                if normalized_header == 'NRAUTOMATU':
+                    row_device_col = c
+                if normalized_header in czynsz_targets:
+                    row_czynsz_col = c
+                if normalized_header in prad_targets:
+                    row_prad_col = c
+
+            if row_device_col and row_czynsz_col and row_prad_col:
+                header_row = r
+                device_col = row_device_col
+                czynsz_col = row_czynsz_col
+                prad_col = row_prad_col
+                break
+
+        if header_row is None:
+            print(
+                "⚠ Nie znaleziono wymaganych kolumn najmu: "
+                f"Nr.automatu, Czynsz {month_label_slash}, Energia {month_label_slash}"
+            )
+            return {}
+
+        if device_col is None or czynsz_col is None or prad_col is None:
+            print("⚠ Niekompletna konfiguracja kolumn najmu")
+            return {}
+
+        min_col = min(device_col, czynsz_col, prad_col)
+        max_col = max(device_col, czynsz_col, prad_col)
+        device_idx = device_col - min_col
+        czynsz_idx = czynsz_col - min_col
+        prad_idx = prad_col - min_col
+
+        rent_map = {}
+        skipped_rows = 0
+        empty_streak = 0
+
+        for row_values in ws.iter_rows(
+            min_row=header_row + 1,
+            max_row=ws.max_row,
+            min_col=min_col,
+            max_col=max_col,
+            values_only=True,
+        ):
+            raw_device = row_values[device_idx]
+            raw_czynsz = row_values[czynsz_idx]
+            raw_prad = row_values[prad_idx]
+
+            if raw_device is None and raw_czynsz is None and raw_prad is None:
+                empty_streak += 1
+                if empty_streak >= 200:
+                    break
+                continue
+
+            empty_streak = 0
+
+            device_id = _parse_device_id(raw_device)
+            if device_id is None:
+                skipped_rows += 1
+                continue
+
+            rent_map[device_id] = {
+                'czynsz': _as_float(raw_czynsz),
+                'prad': _as_float(raw_prad),
+            }
+
+        if skipped_rows:
+            print(f"⚠ Pominięto {skipped_rows} wierszy najmu z nieprawidłowym Nr.automatu")
+
+        return rent_map
+    finally:
+        wb.close()
 
 
 def _get_monthly_costs_per_device(
@@ -1530,7 +2017,8 @@ def _get_monthly_costs_per_device(
         start_row=(serwis_row + 1) if serwis_row else 1,
         end_row=serwis_end_row,
     )
-    global_costs['serwis'] = serwis_glowny + serwis_szyszkowska + serwis_zdankiewicz
+    global_costs['serwis'] = serwis_glowny + serwis_szyszkowska
+    global_costs['zdankiewicz'] = serwis_zdankiewicz
 
     # Czynsz i prąd są pobierane per automat z pliku najmu.
     global_costs['czynsz'] = 0.0
@@ -1552,18 +2040,29 @@ def _get_monthly_costs_per_device(
         month_col=9,
         value_col=11,
     )
-    global_costs['oh'] = 0.0
+    # OH będzie liczony per-device poniżej
 
     device_count = len(normalized_ids)
     costs_by_device = {}
     for device_id in normalized_ids:
         per_device = {}
         for key, value in global_costs.items():
+            if key == 'oh':
+                continue
             per_device[key] = float(value or 0.0) / device_count
 
         rent_entry = rent_by_device.get(device_id, {})
         per_device['czynsz'] = float(rent_entry.get('czynsz', 0.0) or 0.0)
         per_device['prad'] = float(rent_entry.get('prad', 0.0) or 0.0)
+        
+        # Calculate OH per device: (NON_TVM + Project_variable_costs + TVM_sum) * 0.2
+        tvm_sum = sum(float(per_device.get(key, 0.0) or 0.0) for key in TVM_COST_KEYS)
+        per_device['oh'] = (
+            float(per_device.get('non_tvm', 0.0) or 0.0) +
+            float(per_device.get('project_variable_costs', 0.0) or 0.0) +
+            tvm_sum
+        ) * 0.2
+        
         costs_by_device[device_id] = per_device
 
     return costs_by_device
@@ -1649,9 +2148,12 @@ def get_monthly_revenue(
 
 def _normalize_carrier_code(carrier):
     """
-    Normalizuje kod przewoźnika do postaci używanej w raporcie.
+    Normalizuje kod przewoźnika do postaci technicznej używanej w kluczach.
+    Usuwa diakrytyki, np. KMŁ -> KML.
     """
     normalized = str(carrier or '').strip().upper()
+    normalized = unicodedata.normalize('NFKD', normalized)
+    normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
     return normalized
 
 
@@ -1672,7 +2174,7 @@ def _display_carrier_label(carrier_code):
     """
     Zwraca etykietę przewoźnika do nagłówka raportu.
     """
-    normalized = str(carrier_code or '').strip().upper()
+    normalized = _normalize_carrier_code(carrier_code)
     if normalized == 'KML':
         return 'KMŁ'
     return normalized
@@ -1683,7 +2185,7 @@ def _resolve_transactions_table_for_carrier(carrier_code, default_table):
     Zwraca nazwę tabeli transakcji dla przewoźnika.
     Pozwala nadpisać domyślną tabelę dla wybranych schematów.
     """
-    normalized = str(carrier_code or '').strip().upper()
+    normalized = _normalize_carrier_code(carrier_code)
     return TRANSACTIONS_TABLE_OVERRIDES.get(normalized, default_table)
 
 
@@ -1691,7 +2193,7 @@ def _resolve_transactions_device_col_for_carrier(carrier_code, default_device_co
     """
     Zwraca kolumnę urządzenia dla przewoźnika (string lub lista fallbacków).
     """
-    normalized = str(carrier_code or '').strip().upper()
+    normalized = _normalize_carrier_code(carrier_code)
     return TRANSACTIONS_DEVICE_COL_OVERRIDES.get(normalized, default_device_col)
 
 
@@ -1699,7 +2201,7 @@ def _resolve_transactions_amount_col_for_carrier(carrier_code, default_amount_co
     """
     Zwraca kolumnę kwoty dla przewoźnika (string lub lista fallbacków).
     """
-    normalized = str(carrier_code or '').strip().upper()
+    normalized = _normalize_carrier_code(carrier_code)
     return TRANSACTIONS_AMOUNT_COL_OVERRIDES.get(normalized, default_amount_col)
 
 
@@ -1707,7 +2209,7 @@ def _resolve_transactions_payment_method_col_for_carrier(carrier_code, default_p
     """
     Zwraca kolumnę metody płatności dla przewoźnika (string lub lista fallbacków).
     """
-    normalized = str(carrier_code or '').strip().upper()
+    normalized = _normalize_carrier_code(carrier_code)
     return TRANSACTIONS_PAYMENT_METHOD_COL_OVERRIDES.get(normalized, default_payment_method_col)
 
 
@@ -1876,6 +2378,7 @@ def get_monthly_revenue_by_carrier(
     """
     start_date, end_date = get_month_range_closed(month_str)
     carriers = carriers or CARRIERS
+    expected_carriers = sorted({_normalize_carrier_code(carrier) for carrier in carriers})
 
     revenue_data = {}
 
@@ -1994,6 +2497,16 @@ def get_monthly_revenue_by_carrier(
         )
         print(f"  Suma {carrier_code}: {carrier_total:,.2f} zł")
 
+    observed_carriers = sorted({
+        code
+        for rev_device in revenue_data.values()
+        for code in rev_device.get('by_carrier', {}).keys()
+    })
+    print(f"✓ Przewoźnicy w obrocie: {observed_carriers}")
+    missing_expected = sorted(set(expected_carriers) - set(observed_carriers))
+    if missing_expected:
+        print(f"⚠ Brak danych obrotu dla przewoźników: {missing_expected}")
+
     return revenue_data
 
 
@@ -2004,7 +2517,7 @@ def export_to_excel_PL(
     revenue_data,
     month_str,
     filename,
-    commission_data=None,
+    commission_rules=None,
     carriers=None,
     location_by_device=None,
     automat_type_by_device=None,
@@ -2018,8 +2531,8 @@ def export_to_excel_PL(
     Eksportuje raport P&L do Excela.
     Układ danych: jeden wiersz per automat, kolumny brutto i metody płatności per przewoźnik.
     """
-    if commission_data is None:
-        commission_data = {}
+    if commission_rules is None:
+        commission_rules = {}
 
     carrier_order = []
     for carrier in (carriers or CARRIERS):
@@ -2046,11 +2559,15 @@ def export_to_excel_PL(
     for code in carrier_order:
         label = _display_carrier_label(code)
         headers.append(f"Brutto {label}")
+        headers.append(f"Prowizja {label}")
         headers.append(f"Netto {label}")
         headers.append(f"{PAYMENT_METHOD_LABELS['gotowka']} {label}")
         headers.append(f"{PAYMENT_METHOD_LABELS['karta']} {label}")
         headers.append(f"{PAYMENT_METHOD_LABELS['blik']} {label}")
     headers.append('Brutto Suma')
+    headers.append('Transakcje bezgotówkowe Suma')
+    headers.append('Prowizja Suma')
+    headers.append('Dodatkowe zyski')
     headers.append('Netto Suma')
 
     for key in TVM_COST_KEYS:
@@ -2066,6 +2583,10 @@ def export_to_excel_PL(
     headers.append('BLIK Suma')
     headers.append('Gotówka Suma')
     headers.append('Transakcje bezgotówkowe')
+    headers.append('Wynik (Prowizja - Koszty)')
+    headers.append('UWAGI')
+    result_col_idx = headers.index('Wynik (Prowizja - Koszty)') + 1
+    uwagi_col_idx = len(headers)
     
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_num)
@@ -2123,10 +2644,14 @@ def export_to_excel_PL(
         ws.cell(row=row_num, column=3).value = automat_type
 
         row_total = 0.0
+        row_commission_total = 0.0
         row_netto_total = 0.0
         cash_total = 0.0
         card_total = 0.0
         blik_total = 0.0
+        carrier_cashless_total = 0.0
+        carrier_cashless_by_code = {}
+        month_start, month_end = _month_date_bounds(month_str)
         col_idx = 4
         for carrier_code in carrier_order:
             rev = rev_by_carrier.get(carrier_code)
@@ -2144,29 +2669,61 @@ def export_to_excel_PL(
             cash_total += by_payment_method['gotowka']
             card_total += by_payment_method['karta']
             blik_total += by_payment_method['blik']
+            cashless_for_carrier = by_payment_method['karta'] + by_payment_method['blik']
+            carrier_cashless_total += cashless_for_carrier
+            carrier_cashless_by_code[carrier_code] = cashless_for_carrier
+
+            rules_for_key = commission_rules.get((int(device_id), carrier_code), [])
+            picked_rules = _pick_commission_rules_for_month(rules_for_key, month_start, month_end)
+            commission_amount = _commission_amount_from_rules(picked_rules, netto_amount)
 
             ws.cell(row=row_num, column=col_idx).value = amount
             ws.cell(row=row_num, column=col_idx).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 1).value = netto_amount
+            ws.cell(row=row_num, column=col_idx + 1).value = commission_amount
             ws.cell(row=row_num, column=col_idx + 1).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 2).value = by_payment_method['gotowka']
+            ws.cell(row=row_num, column=col_idx + 2).value = netto_amount
             ws.cell(row=row_num, column=col_idx + 2).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 3).value = by_payment_method['karta']
+            ws.cell(row=row_num, column=col_idx + 3).value = by_payment_method['gotowka']
             ws.cell(row=row_num, column=col_idx + 3).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 4).value = by_payment_method['blik']
+            ws.cell(row=row_num, column=col_idx + 4).value = by_payment_method['karta']
             ws.cell(row=row_num, column=col_idx + 4).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=col_idx + 5).value = by_payment_method['blik']
+            ws.cell(row=row_num, column=col_idx + 5).number_format = '#,##0.00'
             row_total += amount
+            row_commission_total += commission_amount
             row_netto_total += netto_amount
 
-            col_idx += 5
+            col_idx += 6
 
         total_col = col_idx
         ws.cell(row=row_num, column=total_col).value = row_total
         ws.cell(row=row_num, column=total_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=total_col + 1).value = row_netto_total
+        ws.cell(row=row_num, column=total_col + 1).value = carrier_cashless_total
         ws.cell(row=row_num, column=total_col + 1).number_format = '#,##0.00'
 
+        prowizja_suma_col = total_col + 2
+        dodatkowe_zyski_col = total_col + 3
+        netto_suma_col = total_col + 4
+        extra_ref = f"{get_column_letter(dodatkowe_zyski_col)}{row_num}"
+        per_carrier_commission_refs = [
+            f"{get_column_letter(4 + idx * 6 + 1)}{row_num}"
+            for idx in range(len(carrier_order))
+        ]
+        sum_commission_expr = '+'.join(per_carrier_commission_refs) if per_carrier_commission_refs else '0'
+        ws.cell(row=row_num, column=prowizja_suma_col).value = f"={sum_commission_expr}+IF({extra_ref}=\"\",0,{extra_ref})"
+        ws.cell(row=row_num, column=prowizja_suma_col).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=dodatkowe_zyski_col).value = None
+        ws.cell(row=row_num, column=dodatkowe_zyski_col).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=netto_suma_col).value = row_netto_total
+        ws.cell(row=row_num, column=netto_suma_col).number_format = '#,##0.00'
+
         cost_entry = dict(costs_by_device.get(device_id, {}))
+        it_card_value = 0.0
+        for carrier_code, carrier_cashless in carrier_cashless_by_code.items():
+            rate = IT_CARD_RATE_BY_CARRIER.get(carrier_code, DEFAULT_IT_CARD_RATE)
+            it_card_value += carrier_cashless * rate
+        cost_entry['it_card'] = it_card_value
+
         if automat_type == 'BB':
             bb_type_count += 1
             normalized_location = _normalize_text_for_match(lokalizacja)
@@ -2180,7 +2737,7 @@ def export_to_excel_PL(
                 cost_entry['amortyzacja'] = 0.0
                 bb_missing += 1
 
-        costs_col = total_col + 2
+        costs_col = total_col + 5
         tvm_cost_sum = 0.0
         for key in TVM_COST_KEYS:
             val = float(cost_entry.get(key, 0.0) or 0.0)
@@ -2193,31 +2750,57 @@ def export_to_excel_PL(
         ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
         costs_col += 1
 
-        non_tvm_val = float(cost_entry.get('non_tvm', 0.0) or 0.0)
-        project_val = float(cost_entry.get('project_variable_costs', 0.0) or 0.0)
-        oh_val = float(cost_entry.get('oh', 0.0) or 0.0)
-        other_total = non_tvm_val + project_val + oh_val
+        other_costs_offset = len(OTHER_COST_KEYS)
+        other_total = 0.0
+        for offset, key in enumerate(OTHER_COST_KEYS):
+            val = float(cost_entry.get(key, 0.0) or 0.0)
+            other_total += val
+            ws.cell(row=row_num, column=costs_col + offset).value = val
+            ws.cell(row=row_num, column=costs_col + offset).number_format = '#,##0.00'
+
         all_costs_total = tvm_cost_sum + other_total
 
-        ws.cell(row=row_num, column=costs_col).value = non_tvm_val
-        ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 1).value = project_val
-        ws.cell(row=row_num, column=costs_col + 1).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 2).value = oh_val
-        ws.cell(row=row_num, column=costs_col + 2).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 3).value = other_total
-        ws.cell(row=row_num, column=costs_col + 3).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 4).value = all_costs_total
-        ws.cell(row=row_num, column=costs_col + 4).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset).value = other_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 1).value = all_costs_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 1).number_format = '#,##0.00'
 
-        ws.cell(row=row_num, column=costs_col + 5).value = card_total
-        ws.cell(row=row_num, column=costs_col + 5).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 6).value = blik_total
-        ws.cell(row=row_num, column=costs_col + 6).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 7).value = cash_total
-        ws.cell(row=row_num, column=costs_col + 7).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + 8).value = card_total + blik_total
-        ws.cell(row=row_num, column=costs_col + 8).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 2).value = card_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 2).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 3).value = blik_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 3).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).value = cash_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).value = card_total + blik_total
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).number_format = '#,##0.00'
+
+        prowizja_ref = f"{get_column_letter(prowizja_suma_col)}{row_num}"
+        suma_koszty_ref = f"{get_column_letter(costs_col + other_costs_offset + 1)}{row_num}"
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).value = f"={prowizja_ref}-{suma_koszty_ref}"
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=uwagi_col_idx).value = None
+        row_num += 1
+
+    last_data_row = row_num - 1
+
+    if last_data_row >= 2:
+        summary_row = row_num
+        ws.cell(row=summary_row, column=1).value = 'PODSUMOWANIE'
+        ws.cell(row=summary_row, column=2).value = None
+        ws.cell(row=summary_row, column=3).value = None
+        ws.cell(row=summary_row, column=uwagi_col_idx).value = None
+
+        for col_num in range(4, uwagi_col_idx):
+            col_letter = get_column_letter(col_num)
+            summary_cell = ws.cell(row=summary_row, column=col_num)
+            summary_cell.value = f"=SUM({col_letter}2:{col_letter}{last_data_row})"
+            summary_cell.number_format = '#,##0.00'
+
+        for col_num in range(1, uwagi_col_idx + 1):
+            cell = ws.cell(row=summary_row, column=col_num)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+
         row_num += 1
 
     if bb_type_count:
@@ -2227,6 +2810,26 @@ def export_to_excel_PL(
             f"po Nazwa={bb_matched_by_location}, "
             f"po Nr.inw={bb_matched_by_nr}, "
             f"braki={bb_missing}"
+        )
+
+    if last_data_row >= 2:
+        result_col_letter = ws.cell(row=1, column=result_col_idx).column_letter
+        result_range = f"{result_col_letter}2:{result_col_letter}{last_data_row}"
+        ws.conditional_formatting.add(
+            result_range,
+            CellIsRule(
+                operator='greaterThanOrEqual',
+                formula=['0'],
+                fill=PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),
+            ),
+        )
+        ws.conditional_formatting.add(
+            result_range,
+            CellIsRule(
+                operator='lessThan',
+                formula=['0'],
+                fill=PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),
+            ),
         )
     
     # Dostosuj szerokość kolumn
@@ -2244,7 +2847,77 @@ def export_to_excel_PL(
     
     wb.save(filepath)
     print(f"\n✓ Raport P&L eksportowany: {filepath}")
-    print(f"✓ Liczba wierszy: {row_num - 2}")
+    print(f"✓ Liczba wierszy: {len(all_device_ids)}")
+
+
+def _build_month_export_payload(conn, month_str, args, dictionary_comparison):
+    """
+    Buduje dane wejściowe do eksportu dla wskazanego miesiąca.
+    """
+    if args.obrot_source_mode == 'carrier-transactions':
+        revenue_data = get_monthly_revenue_by_carrier(
+            conn,
+            month_str,
+            carriers=args.obrot_carriers,
+            table_name=args.obrot_transactions_table,
+            amount_col=args.obrot_transactions_amount_col,
+            date_col=args.obrot_transactions_date_col,
+            device_col=args.obrot_transactions_device_col,
+            payment_method_col=args.obrot_transactions_payment_method_col,
+            use_device_range_filter=not args.obrot_no_device_range_filter,
+        )
+    else:
+        revenue_data = get_monthly_revenue(
+            conn,
+            month_str,
+            schema=args.schema,
+            actioncodes=args.obrot_actioncodes,
+            mctype=args.obrot_mctype,
+            use_device_range_filter=not args.obrot_no_device_range_filter,
+        )
+
+    commission_rules, xlsx_location_by_device = load_commission_rules_and_locations_from_xlsx(
+        month_str,
+        commission_file=args.prowizja_file,
+    )
+
+    all_device_ids = sorted(set(
+        [int(k) for k in dictionary_comparison.keys()] +
+        [int(k) for k in revenue_data.keys()]
+    ))
+
+    location_by_device = {
+        int(device_id): location
+        for device_id, location in xlsx_location_by_device.items()
+        if int(device_id) in all_device_ids
+    }
+
+    missing_location_ids = [device_id for device_id in all_device_ids if device_id not in location_by_device]
+    if missing_location_ids:
+        fallback_location_by_device = get_locations_by_carrier(
+            conn,
+            device_ids=missing_location_ids,
+            carriers=args.obrot_carriers,
+        )
+        for device_id, location in fallback_location_by_device.items():
+            if device_id not in location_by_device and location:
+                location_by_device[device_id] = location
+
+    automat_type_by_device = get_automat_type_by_device_from_av(
+        conn,
+        all_device_ids,
+        schema_name='AV',
+        table_name='dictionary',
+        value_col='value',
+        groupid_col='groupid',
+    )
+
+    return {
+        'revenue_data': revenue_data,
+        'commission_rules': commission_rules,
+        'location_by_device': location_by_device,
+        'automat_type_by_device': automat_type_by_device,
+    }
 
 
 # === MAIN ===
@@ -2359,6 +3032,12 @@ def main():
         help='Ścieżka do pliku .xls z raportu PROVISION (single sheet) do porównania'
     )
     parser.add_argument(
+        '--prowizja-file',
+        type=str,
+        default=str(DEFAULT_PROWIZJE_FILE),
+        help='Ścieżka do pliku Excel z prowizjami i lokalizacjami (domyślnie: Prowizje_AB.xlsx)'
+    )
+    parser.add_argument(
         '--koszty-file',
         type=str,
         default=str(DEFAULT_COSTS_FILE),
@@ -2456,10 +3135,10 @@ def main():
         conn = connect_to_db(database_name=None, max_retries=3, retry_delay=5)
         if conn is None:
             print("❌ Nie można nawiązać połączenia z bazą danych")
-            return
+            raise SystemExit(1)
     except psycopg2.Error as e:
         print(f"❌ Błąd połączenia z bazą: {e}")
-        return
+        raise SystemExit(1)
 
     if args.validate_provision_only:
         if not args.reference_provision_xls:
@@ -2603,19 +3282,23 @@ def main():
     print(f"  Liczba transakcji: {total_transactions:,}")
 
     # === KROK 3: Prowizja miesięczna ===
-    print(f"\n[4/6] Pobieranie prowizji za {month_str}...")
-    commission_data = get_monthly_commission(
-        conn,
+    print(f"\n[4/6] Pobieranie prowizji i lokalizacji z pliku {args.prowizja_file}...")
+    commission_rules, xlsx_location_by_device = load_commission_rules_and_locations_from_xlsx(
         month_str,
-        source_config=commission_source,
-        strict_month_window=args.strict_prowizja_month_window,
+        commission_file=args.prowizja_file,
     )
-    print(f"✓ Pobrano dane prowizji dla {len(commission_data)} automatów")
+    print(f"✓ Wczytano reguły prowizji: {len(commission_rules)} par (automat, przewoźnik)")
+
+    commission_data = build_monthly_commission_data_from_rules(
+        revenue_data,
+        commission_rules,
+        month_str,
+    )
     total_commission = sum(v['prowizja_zl'] for v in commission_data.values())
-    print(f"  Prowizja łączna: {total_commission:,.2f} zł")
+    print(f"  Prowizja łączna (z pliku): {total_commission:,.2f} zł")
 
     if args.reference_provision_xls:
-        print("  🔎 Porównanie prowizji SQL vs plik referencyjny .xls...")
+        print("  🔎 Porównanie danych prowizji vs plik referencyjny .xls...")
         reference_map = load_reference_provision_from_xls(args.reference_provision_xls)
         comparison = compare_commission_with_reference(commission_data, reference_map)
         if comparison is None:
@@ -2625,18 +3308,34 @@ def main():
             print(f"  Nadmiarowe w SQL: {len(comparison['extra_in_sql'])}")
             print(f"  Różnice kwot: {len(comparison['mismatches'])}")
     
-    # === KROK 4: Lokalizacje automatów per przewoźnik ===
-    print(f"\n[5/6] Uzupełnianie lokalizacji automatów ({', '.join(args.obrot_carriers)})...")
+    # === KROK 4: Lokalizacje automatów z pliku prowizji ===
+    print(f"\n[5/6] Uzupełnianie lokalizacji automatów z pliku prowizji...")
     all_device_ids = sorted(set(
         [int(k) for k in dictionary_comparison.keys()] +
         [int(k) for k in revenue_data.keys()]
     ))
-    location_by_device = get_locations_by_carrier(
-        conn,
-        device_ids=all_device_ids,
-        carriers=args.obrot_carriers,
+    location_by_device = {
+        int(device_id): location
+        for device_id, location in xlsx_location_by_device.items()
+        if int(device_id) in all_device_ids
+    }
+
+    missing_location_ids = [device_id for device_id in all_device_ids if device_id not in location_by_device]
+    fallback_location_by_device = {}
+    if missing_location_ids:
+        fallback_location_by_device = get_locations_by_carrier(
+            conn,
+            device_ids=missing_location_ids,
+            carriers=args.obrot_carriers,
+        )
+        for device_id, location in fallback_location_by_device.items():
+            if device_id not in location_by_device and location:
+                location_by_device[device_id] = location
+
+    print(
+        f"✓ Uzupełniono lokalizacje dla {len(location_by_device)} / {len(all_device_ids)} automatów "
+        f"(z pliku: {len(xlsx_location_by_device)}, fallback: {len(fallback_location_by_device)})"
     )
-    print(f"✓ Uzupełniono lokalizacje dla {len(location_by_device)} / {len(all_device_ids)} automatów")
 
     automat_type_by_device = get_automat_type_by_device_from_av(
         conn,
@@ -2648,8 +3347,6 @@ def main():
     )
     print(f"✓ Uzupełniono typ automatu dla {len(automat_type_by_device)} / {len(all_device_ids)} automatów")
 
-    conn.close()
-
     # === KROK 5: Eksport do Excel ===
     print(f"\n[6/6] Eksport do Excel...")
     filename = build_output_filename(month_str, naming_mode=args.output_naming)
@@ -2658,7 +3355,7 @@ def main():
         revenue_data,
         month_str,
         filename,
-        commission_data=commission_data,
+        commission_rules=commission_rules,
         carriers=args.obrot_carriers,
         location_by_device=location_by_device,
         automat_type_by_device=automat_type_by_device,
@@ -2668,12 +3365,38 @@ def main():
         amortyzacja_file=args.amortyzacja_file,
         amortyzacja_sheet=args.amortyzacja_sheet,
     )
+
+    report_year = int(month_str.split('-')[0])
+    january_month_str = f"{report_year}-01"
+    if january_month_str != month_str:
+        print(f"\n[EXTRA] Generowanie osobnego skoroszytu dla stycznia ({january_month_str})...")
+        january_payload = _build_month_export_payload(
+            conn,
+            january_month_str,
+            args,
+            dictionary_comparison,
+        )
+        january_filename = build_output_filename(january_month_str, naming_mode='default')
+        export_to_excel_PL(
+            dictionary_comparison,
+            january_payload['revenue_data'],
+            january_month_str,
+            january_filename,
+            commission_rules=january_payload['commission_rules'],
+            carriers=args.obrot_carriers,
+            location_by_device=january_payload['location_by_device'],
+            automat_type_by_device=january_payload['automat_type_by_device'],
+            costs_file=args.koszty_file,
+            rent_file=args.najem_file,
+            rent_sheet=args.najem_sheet,
+            amortyzacja_file=args.amortyzacja_file,
+            amortyzacja_sheet=args.amortyzacja_sheet,
+        )
+    else:
+        print("\n[EXTRA] Pominieto dodatkowy skoroszyt styczniowy (raport bazowy jest juz za styczen).")
+
+    conn.close()
     
-    print(f"\n{'='*60}")
-    print(f"  ✓ RAPORT ZAKOŃCZONY POMYŚLNIE")
-    print("  Układ: jeden wiersz na automat, obrót per przewoźnik + sekcja kosztów TVM/Other + SUMA KOSZTY")
-    print("  Braki danych per przewoźnik są wpisywane jako 0")
-    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
