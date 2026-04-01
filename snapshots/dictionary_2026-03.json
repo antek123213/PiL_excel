@@ -1,0 +1,329 @@
+{
+  "1101": {
+    "description": "2100779032"
+  },
+  "1102": {
+    "description": "38954678"
+  },
+  "1103": {
+    "description": "2100779033"
+  },
+  "1104": {
+    "description": "38954677"
+  },
+  "1105": {
+    "description": "38954675"
+  },
+  "1106": {
+    "description": "2100778975"
+  },
+  "1107": {
+    "description": "38955461"
+  },
+  "1108": {
+    "description": "2100779012"
+  },
+  "1109": {
+    "description": "2100779021"
+  },
+  "1110": {
+    "description": "2100778989"
+  },
+  "1201": {
+    "description": "0"
+  },
+  "1202": {
+    "description": "0"
+  },
+  "1203": {
+    "description": "1203: Opis"
+  },
+  "1204": {
+    "description": "WROC-GL_1204"
+  },
+  "1205": {
+    "description": "2100453806"
+  },
+  "1206": {
+    "description": "2100453807"
+  },
+  "1207": {
+    "description": "24201580"
+  },
+  "1208": {
+    "description": "1208: Opis"
+  },
+  "1209": {
+    "description": "WROC-GL_1209"
+  },
+  "1210": {
+    "description": "1210: Opis"
+  },
+  "1211": {
+    "description": "2100497500"
+  },
+  "1212": {
+    "description": "1212: Opis"
+  },
+  "1213": {
+    "description": "2100778156"
+  },
+  "1214": {
+    "description": "1214_RZEPIN"
+  },
+  "1215": {
+    "description": "1215: Opis"
+  },
+  "1216": {
+    "description": "1216: Opis"
+  },
+  "1217": {
+    "description": "1217: Opis"
+  },
+  "1218": {
+    "description": "K-CE_1218"
+  },
+  "1219": {
+    "description": "2100453792"
+  },
+  "1220": {
+    "description": "1220: Opis"
+  },
+  "1221": {
+    "description": "29260323"
+  },
+  "1222": {
+    "description": "0"
+  },
+  "1223": {
+    "description": "1223_MALBORK"
+  },
+  "1224": {
+    "description": "2100453770"
+  },
+  "1225": {
+    "description": "24236382"
+  },
+  "1226": {
+    "description": "24234868"
+  },
+  "1227": {
+    "description": "24234867"
+  },
+  "1228": {
+    "description": "JAROCIN_1228"
+  },
+  "1229": {
+    "description": "TARNOW_1229"
+  },
+  "1230": {
+    "description": "24201541"
+  },
+  "1231": {
+    "description": "2100898149"
+  },
+  "1232": {
+    "description": "2100779098"
+  },
+  "1233": {
+    "description": "ZAWIERC_1233"
+  },
+  "1234": {
+    "description": "24201594"
+  },
+  "1235": {
+    "description": "POZN-GL_1235"
+  },
+  "1236": {
+    "description": "POZN-GL_1236"
+  },
+  "1237": {
+    "description": "2100453777"
+  },
+  "1238": {
+    "description": "POZN-GL_1238"
+  },
+  "1239": {
+    "description": "2100453778"
+  },
+  "1240": {
+    "description": "2100453784"
+  },
+  "1241": {
+    "description": "KONIN_1241"
+  },
+  "1242": {
+    "description": "2100453753"
+  },
+  "1243": {
+    "description": "2100982067"
+  },
+  "1244": {
+    "description": "GNIEZNO_1244"
+  },
+  "1245": {
+    "description": "OSTROW_1245"
+  },
+  "1246": {
+    "description": "OSTROW_1246"
+  },
+  "1247": {
+    "description": "24201571"
+  },
+  "1248": {
+    "description": "2100778978"
+  },
+  "1249": {
+    "description": "2100962292"
+  },
+  "1250": {
+    "description": "29257297"
+  },
+  "1251": {
+    "description": "LODZ-WI_1251"
+  },
+  "1252": {
+    "description": "2100453772"
+  },
+  "1253": {
+    "description": "1253: Opis"
+  },
+  "1254": {
+    "description": "1254: Opis"
+  },
+  "1255": {
+    "description": "29260324"
+  },
+  "1256": {
+    "description": "POZN-GL_1256"
+  },
+  "1257": {
+    "description": "POZN-GL_1257"
+  },
+  "1258": {
+    "description": "0"
+  },
+  "1259": {
+    "description": "2100513263"
+  },
+  "1260": {
+    "description": "0"
+  },
+  "1261": {
+    "description": "1261: Opis"
+  },
+  "1262": {
+    "description": "2100520434"
+  },
+  "1263": {
+    "description": "KRAK_GN_1263"
+  },
+  "1264": {
+    "description": "24201545"
+  },
+  "1265": {
+    "description": "2100453776"
+  },
+  "1266": {
+    "description": "LESZNO_1266"
+  },
+  "1267": {
+    "description": "1267: Opis"
+  },
+  "1268": {
+    "description": "2100453813"
+  },
+  "1269": {
+    "description": "2100513261"
+  },
+  "1270": {
+    "description": "24215955"
+  },
+  "1271": {
+    "description": "2100513264"
+  },
+  "1272": {
+    "description": "INOWROC_1272"
+  },
+  "1273": {
+    "description": "2100513265"
+  },
+  "1274": {
+    "description": "2100513253"
+  },
+  "1275": {
+    "description": "2100453804"
+  },
+  "1276": {
+    "description": "24224306"
+  },
+  "1277": {
+    "description": "2101317213"
+  },
+  "1278": {
+    "description": "2100779099"
+  },
+  "1279": {
+    "description": "2101340843"
+  },
+  "1280": {
+    "description": "2101340847"
+  },
+  "1281": {
+    "description": "2101340852"
+  },
+  "1282": {
+    "description": "24224299"
+  },
+  "1283": {
+    "description": "2101340850"
+  },
+  "1284": {
+    "description": "KRAK_GL_1284"
+  },
+  "1285": {
+    "description": "24224298"
+  },
+  "1286": {
+    "description": "1286: Opis"
+  },
+  "1287": {
+    "description": "2100779050"
+  },
+  "1288": {
+    "description": "29282287"
+  },
+  "1289": {
+    "description": "2100453763"
+  },
+  "1290": {
+    "description": "2100453755"
+  },
+  "1291": {
+    "description": "1291_ELBLĄG"
+  },
+  "1292": {
+    "description": "24210519"
+  },
+  "1293": {
+    "description": "2100453790"
+  },
+  "1294": {
+    "description": "24201550"
+  },
+  "1295": {
+    "description": "24201562"
+  },
+  "1296": {
+    "description": "2100453786"
+  },
+  "1297": {
+    "description": "2100453779"
+  },
+  "1298": {
+    "description": "24201626"
+  },
+  "1299": {
+    "description": "1299: Opis"
+  }
+}

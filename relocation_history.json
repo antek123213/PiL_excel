@@ -1,0 +1,56 @@
+{
+  "records": [
+    {"device_id": 1113, "location": "Olawa", "valid_from": "2024-04-08", "valid_to": "2026-03-31", "note": "Relokacja historyczna"},
+    {"device_id": 1113, "location": "Namyslow", "valid_from": "2026-04-01", "valid_to": null, "note": "Relokacja od kwietnia 2026"},
+
+    {"device_id": 1118, "location": "Wroclaw Glowny", "valid_from": null, "valid_to": "2026-03-31", "note": "Lokalizacja do konca marca 2026"},
+    {"device_id": 1119, "location": "Glogow", "valid_from": null, "valid_to": "2025-04-15", "note": "Lokalizacja historyczna"},
+
+    {"device_id": 1122, "location": "Elblag", "valid_from": null, "valid_to": "2026-02-17", "note": "Przed relokacja"},
+    {"device_id": 1122, "location": "Gdansk Glowny", "valid_from": "2026-02-18", "valid_to": null, "note": "Po relokacji"},
+    {"device_id": 1124, "location": "Zwierzyn (Strzelce Krajenskie)", "valid_from": null, "valid_to": "2025-07-10", "note": "Lokalizacja historyczna"},
+    {"device_id": 1125, "location": "Czestochowa", "valid_from": null, "valid_to": "2025-05-31", "note": "Przed relokacja"},
+    {"device_id": 1125, "location": "Koluszki", "valid_from": "2025-06-01", "valid_to": null, "note": "Po relokacji"},
+    {"device_id": 1126, "location": "Warszawa Centralna", "valid_from": "2024-12-11", "valid_to": null, "note": "Lokalizacja od wdrozenia"},
+    {"device_id": 1127, "location": "Warszawa Centralna", "valid_from": "2024-12-11", "valid_to": null, "note": "Lokalizacja od wdrozenia"},
+
+    {"device_id": 1135, "location": "Kielce", "valid_from": "2025-06-27", "valid_to": null, "note": "BB8 po podmianie ST40"},
+    {"device_id": 1136, "location": "Bochnia", "valid_from": "2025-10-17", "valid_to": null, "note": "Relokacja"},
+    {"device_id": 1137, "location": "Poznan Politechnika", "valid_from": "2025-10-08", "valid_to": null, "note": "Relokacja"},
+    {"device_id": 1138, "location": "Rzeszow", "valid_from": "2025-10-16", "valid_to": null, "note": "Relokacja"},
+    {"device_id": 1139, "location": "Warszawa Centralna", "valid_from": "2026-03-19", "valid_to": null, "note": "Nowa lokalizacja"},
+
+    {"device_id": 1140, "location": "Warszawa Centralna", "valid_from": "2026-03-19", "valid_to": null, "note": "Nowa lokalizacja"},
+    {"device_id": 1141, "location": "Warszawa Zachodnia", "valid_from": "2026-03-05", "valid_to": null, "note": "Nowa lokalizacja"},
+
+    {"device_id": 1205, "location": "Wroclaw", "valid_from": null, "valid_to": "2025-05-30", "note": "Lokalizacja historyczna"},
+    {"device_id": 1205, "location": "Ciechocinek", "valid_from": "2026-01-30", "valid_to": null, "note": "Nowa lokalizacja, luka okresu zaakceptowana"},
+
+    {"device_id": 1215, "location": "Aleksandrow Kujawski", "valid_from": "2025-12-12", "valid_to": null, "note": "Nowa lokalizacja"},
+    {"device_id": 1216, "location": "Pszczyna", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+
+    {"device_id": 1224, "location": "Kuznica", "valid_from": "2024-01-01", "valid_to": null, "note": "Od poczatku 2024"},
+    {"device_id": 1227, "location": "Bochnia", "valid_from": null, "valid_to": "2025-10-16", "note": "Lokalizacja historyczna"},
+    {"device_id": 1228, "location": "Sosnowiec", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+    {"device_id": 1229, "location": "Tychy", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+
+    {"device_id": 1231, "location": "Rybnik", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+    {"device_id": 1232, "location": "Bielsko Biala", "valid_from": null, "valid_to": "2025-11-07", "note": "Przed relokacja"},
+    {"device_id": 1232, "location": "Olawa Zachodnia", "valid_from": "2025-11-08", "valid_to": null, "note": "Po relokacji"},
+    {"device_id": 1233, "location": "Lubliniec", "valid_from": null, "valid_to": "2025-06-18", "note": "Potwierdzone"},
+    {"device_id": 1236, "location": "Poznan", "valid_from": null, "valid_to": "2024-09-15", "note": "Przed relokacja"},
+    {"device_id": 1236, "location": "Pelplin", "valid_from": "2024-10-30", "valid_to": null, "note": "Po relokacji"},
+
+    {"device_id": 1248, "location": "Piotrkow Trybunalski", "valid_from": null, "valid_to": "2025-03-04", "note": "Lokalizacja historyczna"},
+
+    {"device_id": 1250, "location": "Radomsko", "valid_from": null, "valid_to": "2025-03-04", "note": "Lokalizacja historyczna"},
+    {"device_id": 1251, "location": "Kielce", "valid_from": null, "valid_to": "2025-06-26", "note": "ST40 podmieniony na BB8 nr 1135"},
+    {"device_id": 1253, "location": "Opole", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+    {"device_id": 1255, "location": "Zabrze", "valid_from": null, "valid_to": "2025-06-18", "note": "Lokalizacja historyczna"},
+
+    {"device_id": 1274, "location": "Krakow", "valid_from": null, "valid_to": "2024-04-08", "note": "Lokalizacja historyczna"},
+    {"device_id": 1274, "location": "Czersk", "valid_from": "2024-04-09", "valid_to": null, "note": "Potwierdzona data startu"},
+    {"device_id": 1275, "location": "Rzeszow Glowny", "valid_from": null, "valid_to": "2025-09-10", "note": "Dworzec tymczasowy"},
+    {"device_id": 1275, "location": "Poznan Debiec", "valid_from": "2026-02-20", "valid_to": null, "note": "Nowa lokalizacja"}
+  ]
+}

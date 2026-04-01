@@ -2,8 +2,4 @@
 2.profit/loss caly arkusz
 3.lokalizacje dac jako stacje pkp
 4. arkusz zestawieniowy jako 1. wybór nr_automatu 2. wybór miesiaca 3. miesiac porownawczy 4.wykresy interaktywne tak zeby dalo sie zoabczyc te autmaty 
-5. najlpesze i najgorsze automaty wyklucz zera
-6. koretka czy dany automat dziala czy nie działa 
-9.prowizja suma
-10. tabela podsumuwujaca 
 11.roczna tabela tylko dane głowne za miesiac
