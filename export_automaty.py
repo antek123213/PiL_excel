@@ -43,6 +43,8 @@ DEFAULT_COSTS_FILE = Path(__file__).parent / 'P&L_2025.11.25_koszty_ROP 2025.xls
 DEFAULT_RENT_FILE = Path(__file__).parent / 'Najem powierzchni 2025-2026.xlsx'
 DEFAULT_AMORTYZACJA_FILE = Path(__file__).parent / 'Amortyzacja miesieczna Automaty.xlsx'
 DEFAULT_PROWIZJE_FILE = Path(__file__).parent / 'Prowizje_AB.xlsx'
+DEFAULT_SERWIS_FILE = Path(__file__).parent / 'Koszty' / 'Serwis AB_02.2026.xlsx'
+DEFAULT_SERWIS_SHEET_INDEX = 4
 DEFAULT_AMORTYZACJA_SHEET = 'bb8'
 DEVICE_ID_RANGES = (
     (1101, 1141),
@@ -233,6 +235,26 @@ def _normalize_tvm_location_text(value):
     if 'opis' in normalized.lower():
         return ''
     return normalized
+
+
+def _resolve_service_file_for_month(month_str, service_file=None):
+    """
+    Wybiera plik serwisu dla danego miesiąca.
+
+    Priorytet:
+    1. jawny plik z CLI
+    2. plik miesięczny w Koszty/Serwis AB_MM.YYYY.xlsx
+    3. brak override'ów, jeśli nie ma pasującego pliku
+    """
+    if service_file is not None:
+        return Path(service_file)
+
+    month_suffix = datetime.strptime(month_str, '%Y-%m').strftime('%m.%Y')
+    monthly_candidate = Path(__file__).parent / 'Koszty' / f'Serwis AB_{month_suffix}.xlsx'
+    if monthly_candidate.exists():
+        return monthly_candidate
+
+    return None
 
 
 # === FUNKCJE POMOCNICZE: DIAGNOSTYKA BAZY DANYCH ===
@@ -714,6 +736,35 @@ def get_month_range_closed(month_str):
     last_day = calendar.monthrange(year, month)[1]
     end_date = datetime(year, month, last_day, 23, 59, 59)
     return start_date, end_date
+
+
+def _iter_months(start_month_str, end_month_str):
+    """
+    Generuje kolejne miesiące w formacie YYYY-MM (włącznie).
+    """
+    current = datetime.strptime(start_month_str, '%Y-%m')
+    end = datetime.strptime(end_month_str, '%Y-%m')
+    while current <= end:
+        yield current.strftime('%Y-%m')
+        current += relativedelta(months=1)
+
+
+def _build_commission_report_months():
+    """
+    Zwraca docelowy zakres miesięcy zestawienia prowizji.
+    """
+    return list(_iter_months('2025-01', '2026-12'))
+
+
+def _forecast_source_month_for_2026(month_str):
+    """
+    Dla miesięcy 2026-04..2026-12 zwraca analogiczny miesiąc z 2025.
+    Dla pozostałych miesięcy zwraca None.
+    """
+    year, month = map(int, month_str.split('-'))
+    if year == 2026 and 4 <= month <= 12:
+        return f"2025-{month:02d}"
+    return None
 
 
 def _pick_first_matching_column(columns, candidates):
@@ -1338,6 +1389,51 @@ def _find_header_col(row_map, predicate):
     return None
 
 
+def _candidate_commission_sheet_names(wb, month_str):
+    """
+    Zwraca arkusze prowizji w kolejności od najbardziej pasujących do miesiąca.
+    """
+    year, month = month_str.split('-')
+    month_tokens = {
+        _normalize_header_text(month_str),
+        _normalize_header_text(year),
+        _normalize_header_text(f"{year}-{month}"),
+        _normalize_header_text(f"{month}.{year}"),
+        _normalize_header_text(f"{month}/{year}"),
+        _normalize_header_text(f"{year}_{month}"),
+        _normalize_header_text(f"{month}_{year}"),
+        _normalize_header_text(f"{month}{year}"),
+        _normalize_header_text(f"{year}{month}"),
+    }
+
+    ordered = []
+    fallback = []
+
+    for sheet_name in wb.sheetnames:
+        normalized_sheet_name = _normalize_header_text(sheet_name)
+        if not normalized_sheet_name:
+            fallback.append(sheet_name)
+            continue
+
+        score = 0
+        if normalized_sheet_name == _normalize_header_text(month_str):
+            score += 50
+        if normalized_sheet_name == _normalize_header_text(year):
+            score += 40
+        if any(token and token in normalized_sheet_name for token in month_tokens):
+            score += 20
+        if year in normalized_sheet_name:
+            score += 10
+
+        if score > 0:
+            ordered.append((score, sheet_name))
+        else:
+            fallback.append(sheet_name)
+
+    ordered.sort(key=lambda item: (-item[0], wb.sheetnames.index(item[1])))
+    return [sheet_name for _, sheet_name in ordered] + fallback
+
+
 def _pick_commission_rules_for_month(rules, month_start, month_end):
     """
     Wybiera najtrafniejsze rekordy prowizji dla miesiąca.
@@ -1425,11 +1521,14 @@ def build_monthly_commission_data_from_rules(revenue_data, commission_rules, mon
         matched_records = 0
 
         for carrier_code, carrier_entry in by_carrier.items():
-            gross_amount = 0.0
             net_amount = 0.0
             if isinstance(carrier_entry, dict):
-                gross_amount = float(carrier_entry.get('obrot_brutto_zl', 0.0) or 0.0)
-                net_amount = gross_amount / 1.08
+                by_payment_method = carrier_entry.get('by_payment_method', {}) or {}
+                cashless_gross_amount = (
+                    float(by_payment_method.get('karta', 0.0) or 0.0)
+                    + float(by_payment_method.get('blik', 0.0) or 0.0)
+                )
+                net_amount = cashless_gross_amount / 1.08
 
             rules_for_key = commission_rules.get((device_id_int, carrier_code), [])
             picked_rules = _pick_commission_rules_for_month(rules_for_key, month_start, month_end)
@@ -1477,66 +1576,77 @@ def load_commission_rules_and_locations_from_xlsx(month_str, commission_file=DEF
     if not wb.sheetnames:
         return {}, {}
 
-    ws = wb[wb.sheetnames[0]]
     header_row = None
     header_map = {}
 
-    scan_to = min(ws.max_row, 40)
-    for r in range(1, scan_to + 1):
-        row_map = {}
-        for c in range(1, ws.max_column + 1):
-            token = _normalize_excel_commission_header(ws.cell(r, c).value)
-            if not token:
+    ws = None
+    for sheet_name in _candidate_commission_sheet_names(wb, month_str):
+        candidate_ws = wb[sheet_name]
+        scan_to = min(candidate_ws.max_row, 40)
+        candidate_header_row = None
+        candidate_header_map = {}
+
+        for r in range(1, scan_to + 1):
+            row_map = {}
+            for c in range(1, candidate_ws.max_column + 1):
+                token = _normalize_excel_commission_header(candidate_ws.cell(r, c).value)
+                if not token:
+                    continue
+                row_map[token] = c
+
+            if not row_map:
                 continue
-            row_map[token] = c
 
-        if not row_map:
-            continue
+            carrier_col = _find_header_col(row_map, lambda k: 'PRZEWOZNIK' in k)
+            device_col = _find_header_col(row_map, lambda k: 'NUMERAUTOMATU' in k)
+            valid_from_col = _find_header_col(
+                row_map,
+                lambda k: (
+                    'WAZNOSCOD' in k
+                    or 'WANOOD' in k
+                    or (k.startswith('WA') and k.endswith('OD'))
+                ),
+            )
+            valid_to_col = _find_header_col(
+                row_map,
+                lambda k: (
+                    'WAZNOSCDO' in k
+                    or 'WANODO' in k
+                    or (k.startswith('WA') and k.endswith('DO'))
+                ),
+            )
+            fixed_col = _find_header_col(
+                row_map,
+                lambda k: (
+                    'RYCZALT' in k
+                    or 'RYCZAT' in k
+                    or 'STALA' in k
+                    or 'KWOTOWA' in k
+                ),
+            )
+            percent_col = _find_header_col(row_map, lambda k: 'PROCENTOWA' in k or 'PROCENT' in k)
+            location_col = _find_header_col(row_map, lambda k: 'TVMLOCATION1' in k)
 
-        carrier_col = _find_header_col(row_map, lambda k: 'PRZEWOZNIK' in k)
-        device_col = _find_header_col(row_map, lambda k: 'NUMERAUTOMATU' in k)
-        valid_from_col = _find_header_col(
-            row_map,
-            lambda k: (
-                'WAZNOSCOD' in k
-                or 'WANOOD' in k
-                or (k.startswith('WA') and k.endswith('OD'))
-            ),
-        )
-        valid_to_col = _find_header_col(
-            row_map,
-            lambda k: (
-                'WAZNOSCDO' in k
-                or 'WANODO' in k
-                or (k.startswith('WA') and k.endswith('DO'))
-            ),
-        )
-        fixed_col = _find_header_col(
-            row_map,
-            lambda k: (
-                'RYCZALT' in k
-                or 'RYCZAT' in k
-                or 'STALA' in k
-                or 'KWOTOWA' in k
-            ),
-        )
-        percent_col = _find_header_col(row_map, lambda k: 'PROCENTOWA' in k or 'PROCENT' in k)
-        location_col = _find_header_col(row_map, lambda k: 'TVMLOCATION1' in k)
+            if carrier_col and device_col and valid_from_col and valid_to_col and (fixed_col or percent_col):
+                candidate_header_row = r
+                candidate_header_map = {
+                    'carrier_col': carrier_col,
+                    'device_col': device_col,
+                    'valid_from_col': valid_from_col,
+                    'valid_to_col': valid_to_col,
+                    'fixed_col': fixed_col,
+                    'percent_col': percent_col,
+                    'location_col': location_col,
+                }
+                break
 
-        if carrier_col and device_col and valid_from_col and valid_to_col and (fixed_col or percent_col):
-            header_row = r
-            header_map = {
-                'carrier_col': carrier_col,
-                'device_col': device_col,
-                'valid_from_col': valid_from_col,
-                'valid_to_col': valid_to_col,
-                'fixed_col': fixed_col,
-                'percent_col': percent_col,
-                'location_col': location_col,
-            }
+        if candidate_header_row is not None:
+            ws = candidate_ws
+            header_row = candidate_header_row
+            header_map = candidate_header_map
             break
 
-    if header_row is None:
+    if header_row is None or ws is None:
         print("⚠ Nie znaleziono wymaganych kolumn w pliku prowizji")
         return {}, {}
 
@@ -1684,6 +1794,45 @@ def _build_month_header_targets(month_str):
     return {token for token in tokens if token}
 
 
+def _resolve_sheet_name_by_month(wb, month_str, preferred_sheet=None):
+    """
+    Wybiera arkusz najlepiej pasujący do miesiąca.
+    """
+    if not wb.sheetnames:
+        return None
+
+    if preferred_sheet and preferred_sheet in wb.sheetnames:
+        return preferred_sheet
+
+    year = month_str.split('-')[0]
+    if year in wb.sheetnames:
+        return year
+
+    normalized_year = _normalize_header_text(year)
+    best_sheet = None
+    best_score = 0
+
+    for sheet_name in wb.sheetnames:
+        normalized_sheet = _normalize_header_text(sheet_name)
+        if not normalized_sheet:
+            continue
+
+        score = 0
+        if normalized_sheet == normalized_year:
+            score += 50
+        if normalized_year and normalized_year in normalized_sheet:
+            score += 20
+
+        if score > best_score:
+            best_score = score
+            best_sheet = sheet_name
+
+    if best_sheet is not None and best_score > 0:
+        return best_sheet
+
+    return wb.sheetnames[0]
+
+
 def _load_bb_amortyzacja_sources(
     month_str,
     amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
@@ -1822,10 +1971,9 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
         print(f"⚠ Nie udało się odczytać pliku najmu: {e}")
         return {}
 
-    year_sheet = month_str.split('-')[0]
-    sheet_name = str(rent_sheet or year_sheet)
-    if sheet_name not in wb.sheetnames:
-        print(f"⚠ Brak arkusza {sheet_name} w pliku najmu: {rent_path.name}")
+    sheet_name = _resolve_sheet_name_by_month(wb, month_str, preferred_sheet=rent_sheet)
+    if sheet_name is None:
+        print(f"⚠ Nie znaleziono arkusza najmu dla miesiąca {month_str} w pliku: {rent_path.name}")
         return {}
 
     try:
@@ -1940,12 +2088,107 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
         wb.close()
 
 
+def _load_service_overrides_from_xlsx(service_file=None, sheet_index=DEFAULT_SERWIS_SHEET_INDEX):
+    """
+    Wczytuje lokalizację i koszt serwisu per automat z pliku Serwis AB.
+    Oczekiwane kolumny: Nr TVM, LOKALIZACJA, SERWIS KOSZT.
+    """
+    location_by_device = {}
+    service_cost_by_device = {}
+    if service_file is None:
+        return location_by_device, service_cost_by_device
+
+    service_path = Path(service_file)
+    if not service_path.exists():
+        print(f"⚠ Brak pliku serwisu: {service_path}")
+        return location_by_device, service_cost_by_device
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(service_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku serwisu: {e}")
+        return location_by_device, service_cost_by_device
+
+    try:
+        sheet_idx = int(sheet_index)
+        if sheet_idx < 1 or sheet_idx > len(wb.sheetnames):
+            print(f"⚠ Nieprawidłowy numer arkusza serwisu: {sheet_index}")
+            return location_by_device, service_cost_by_device
+
+        ws = wb[wb.sheetnames[sheet_idx - 1]]
+        header_row = None
+        col_map = {}
+        scan_to = min(ws.max_row, 40)
+        for r in range(1, scan_to + 1):
+            row_map = {}
+            for c in range(1, ws.max_column + 1):
+                token = _normalize_header_text(ws.cell(r, c).value)
+                if token:
+                    row_map[token] = c
+
+            if not row_map:
+                continue
+
+            nr_col = row_map.get('NRTVM')
+            loc_col = row_map.get('LOKALIZACJA')
+            serwis_col = row_map.get('SERWISKOSZT')
+            if nr_col and (loc_col or serwis_col):
+                header_row = r
+                col_map = {
+                    'nr_col': nr_col,
+                    'loc_col': loc_col,
+                    'serwis_col': serwis_col,
+                }
+                break
+
+        if header_row is None:
+            print("⚠ Nie znaleziono nagłówków Nr TVM/LOKALIZACJA/SERWIS KOSZT w pliku serwisu")
+            return location_by_device, service_cost_by_device
+
+        skipped_rows = 0
+        for r in range(header_row + 1, ws.max_row + 1):
+            raw_device = ws.cell(r, col_map['nr_col']).value
+            if raw_device is None and not col_map['loc_col'] and not col_map['serwis_col']:
+                continue
+
+            device_id = _parse_device_id(raw_device)
+            if device_id is None:
+                if _has_nonempty_value(raw_device):
+                    skipped_rows += 1
+                continue
+
+            if col_map['loc_col']:
+                raw_location = ws.cell(r, col_map['loc_col']).value
+                normalized_location = _normalize_tvm_location_text(raw_location)
+                if normalized_location:
+                    location_by_device[device_id] = normalized_location
+
+            if col_map['serwis_col']:
+                raw_serwis = ws.cell(r, col_map['serwis_col']).value
+                if _has_nonempty_value(raw_serwis):
+                    service_cost_by_device[device_id] = _as_float(raw_serwis)
+
+        if skipped_rows:
+            print(f"⚠ Pominięto {skipped_rows} wierszy serwisu z nieprawidłowym Nr TVM")
+
+        print(
+            "✓ Wczytano override serwisu: "
+            f"lokalizacje={len(location_by_device)}, "
+            f"koszt_serwisu={len(service_cost_by_device)}"
+        )
+        return location_by_device, service_cost_by_device
+    finally:
+        wb.close()
+
+
 def _get_monthly_costs_per_device(
     month_str,
     device_ids,
     costs_file=DEFAULT_COSTS_FILE,
     rent_file=DEFAULT_RENT_FILE,
     rent_sheet=None,
+    service_cost_by_device=None,
 ):
     """
     Wczytuje koszty z pliku Excel i rozdziela je na automaty.
@@ -1975,12 +2218,12 @@ def _get_monthly_costs_per_device(
         print(f"⚠ Nie udało się odczytać pliku kosztów: {e}")
         return {device_id: dict(default_entry) for device_id in normalized_ids}
 
-    year_sheet = month_str.split('-')[0]
-    if year_sheet not in wb.sheetnames:
-        print(f"⚠ Brak arkusza {year_sheet} w pliku kosztów: {costs_path.name}")
+    sheet_name = _resolve_sheet_name_by_month(wb, month_str)
+    if sheet_name is None:
+        print(f"⚠ Nie znaleziono arkusza kosztów dla miesiąca {month_str} w pliku: {costs_path.name}")
         return {device_id: dict(default_entry) for device_id in normalized_ids}
 
-    ws = wb[year_sheet]
+    ws = wb[sheet_name]
     global_costs = dict(default_entry)
     rent_by_device = _load_rent_costs_by_device(
         month_str,
@@ -2044,6 +2287,8 @@ def _get_monthly_costs_per_device(
 
     device_count = len(normalized_ids)
     costs_by_device = {}
+    service_cost_by_device = service_cost_by_device or {}
+
     for device_id in normalized_ids:
         per_device = {}
         for key, value in global_costs.items():
@@ -2054,6 +2299,8 @@ def _get_monthly_costs_per_device(
         rent_entry = rent_by_device.get(device_id, {})
         per_device['czynsz'] = float(rent_entry.get('czynsz', 0.0) or 0.0)
         per_device['prad'] = float(rent_entry.get('prad', 0.0) or 0.0)
+        if device_id in service_cost_by_device:
+            per_device['serwis'] = float(service_cost_by_device.get(device_id, 0.0) or 0.0)
         
         # Calculate OH per device: (NON_TVM + Project_variable_costs + TVM_sum) * 0.2
         tvm_sum = sum(float(per_device.get(key, 0.0) or 0.0) for key in TVM_COST_KEYS)
@@ -2066,6 +2313,119 @@ def _get_monthly_costs_per_device(
         costs_by_device[device_id] = per_device
 
     return costs_by_device
+
+
+def _format_worksheet_columns(ws):
+    """
+    Dostosowuje szerokości kolumn arkusza.
+    """
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except Exception:
+                pass
+        ws.column_dimensions[column].width = min(max_length + 2, 50)
+
+
+def _month_label_pl(month_str):
+    """
+    Zwraca nazwę miesiąca po polsku do nagłówków summary.
+    """
+    month_no = int(month_str.split('-')[1])
+    labels = {
+        1: 'styczen',
+        2: 'luty',
+        3: 'marzec',
+        4: 'kwiecien',
+        5: 'maj',
+        6: 'czerwiec',
+        7: 'lipiec',
+        8: 'sierpien',
+        9: 'wrzesien',
+        10: 'pazdziernik',
+        11: 'listopad',
+        12: 'grudzien',
+    }
+    return labels.get(month_no, month_str)
+
+
+def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
+    """
+    Tworzy 3. arkusz zbiorczy Profit/loss per automat i status roczny.
+    """
+    ws = wb.create_sheet(title='ProfitLoss_Summary')
+    ordered_months = sorted(month_to_profit_loss.keys())
+    headers = ['Nr aut.'] + [f"Profit/loss {_month_label_pl(m)}" for m in ordered_months] + ['Zestawienie roczne (+/-)']
+
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    all_device_ids = sorted({
+        int(device_id)
+        for month_map in month_to_profit_loss.values()
+        for device_id in month_map.keys()
+    })
+
+    row_num = 2
+    for device_id in all_device_ids:
+        ws.cell(row=row_num, column=1).value = device_id
+        monthly_sum = 0.0
+        col_idx = 2
+        for month_str in ordered_months:
+            value = float(month_to_profit_loss.get(month_str, {}).get(device_id, 0.0) or 0.0)
+            ws.cell(row=row_num, column=col_idx).value = value
+            ws.cell(row=row_num, column=col_idx).number_format = '#,##0.00'
+            monthly_sum += value
+            col_idx += 1
+
+        status = 'ZERO'
+        if monthly_sum > 0:
+            status = 'PLUS'
+        elif monthly_sum < 0:
+            status = 'MINUS'
+        ws.cell(row=row_num, column=col_idx).value = status
+        row_num += 1
+
+    _format_worksheet_columns(ws)
+
+
+def _create_commission_cumulative_sheet(wb, month_to_commission_sum):
+    """
+    Tworzy arkusz zestawienia prowizji miesięcznej i sumy skumulowanej.
+    """
+    ws = wb.create_sheet(title='Prowizja_Kumulacja')
+    ordered_months = sorted(month_to_commission_sum.keys())
+
+    headers = ['Miesiac', 'Prowizja suma', 'Prowizja skumulowana']
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_num)
+        cell.value = header
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    running_total = 0.0
+    row_num = 2
+    for month_str in ordered_months:
+        monthly_total = float(month_to_commission_sum.get(month_str, 0.0) or 0.0)
+        running_total += monthly_total
+
+        ws.cell(row=row_num, column=1).value = month_str
+        ws.cell(row=row_num, column=2).value = monthly_total
+        ws.cell(row=row_num, column=2).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=3).value = running_total
+        ws.cell(row=row_num, column=3).number_format = '#,##0.00'
+        row_num += 1
+
+    _format_worksheet_columns(ws)
 
 
 def get_monthly_revenue(
@@ -2516,7 +2876,7 @@ def export_to_excel_PL(
     dictionary_comparison,
     revenue_data,
     month_str,
-    filename,
+    filename=None,
     commission_rules=None,
     carriers=None,
     location_by_device=None,
@@ -2526,6 +2886,10 @@ def export_to_excel_PL(
     rent_sheet=None,
     amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
     amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
+    workbook=None,
+    sheet_title=None,
+    save_workbook=True,
+    service_cost_by_device=None,
 ):
     """
     Eksportuje raport P&L do Excela.
@@ -2547,12 +2911,32 @@ def export_to_excel_PL(
                 if code not in carrier_order:
                     carrier_order.append(code)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    filepath = OUTPUT_DIR / filename
-    
-    wb = Workbook()
-    ws = wb.active
-    ws.title = f"P&L {month_str}"
+    filepath = None
+    if save_workbook:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        if filename is None:
+            filename = build_output_filename(month_str, naming_mode='default')
+        filepath = OUTPUT_DIR / filename
+
+    if workbook is None:
+        wb = Workbook()
+        ws = wb.active
+    else:
+        wb = workbook
+        active_ws = wb.active
+        is_placeholder_active = (
+            active_ws is not None
+            and len(wb.worksheets) == 1
+            and active_ws.max_row == 1
+            and active_ws.max_column == 1
+            and active_ws['A1'].value is None
+        )
+        if is_placeholder_active:
+            ws = active_ws
+        else:
+            ws = wb.create_sheet()
+
+    ws.title = sheet_title or f"P&L {month_str}"
     
     # === NAGŁÓWKI ===
     headers = ['Nr aut.', 'Lokalizacja automatu', 'Typ automatu']
@@ -2583,9 +2967,9 @@ def export_to_excel_PL(
     headers.append('BLIK Suma')
     headers.append('Gotówka Suma')
     headers.append('Transakcje bezgotówkowe')
-    headers.append('Wynik (Prowizja - Koszty)')
+    headers.append('Profit/loss')
     headers.append('UWAGI')
-    result_col_idx = headers.index('Wynik (Prowizja - Koszty)') + 1
+    result_col_idx = headers.index('Profit/loss') + 1
     uwagi_col_idx = len(headers)
     
     for col_num, header in enumerate(headers, 1):
@@ -2610,6 +2994,7 @@ def export_to_excel_PL(
         costs_file=costs_file,
         rent_file=rent_file,
         rent_sheet=rent_sheet,
+        service_cost_by_device=service_cost_by_device,
     )
     bb_amort_sources = _load_bb_amortyzacja_sources(
         month_str,
@@ -2620,6 +3005,7 @@ def export_to_excel_PL(
     bb_matched_by_location = 0
     bb_matched_by_nr = 0
     bb_missing = 0
+    profit_loss_by_device = {}
     
     for device_id in all_device_ids:
         # 1-INFO (najpierw mapa lokalizacji zebrana po przewoźnikach)
@@ -2704,13 +3090,12 @@ def export_to_excel_PL(
         prowizja_suma_col = total_col + 2
         dodatkowe_zyski_col = total_col + 3
         netto_suma_col = total_col + 4
-        extra_ref = f"{get_column_letter(dodatkowe_zyski_col)}{row_num}"
         per_carrier_commission_refs = [
             f"{get_column_letter(4 + idx * 6 + 1)}{row_num}"
             for idx in range(len(carrier_order))
         ]
         sum_commission_expr = '+'.join(per_carrier_commission_refs) if per_carrier_commission_refs else '0'
-        ws.cell(row=row_num, column=prowizja_suma_col).value = f"={sum_commission_expr}+IF({extra_ref}=\"\",0,{extra_ref})"
+        ws.cell(row=row_num, column=prowizja_suma_col).value = f"={sum_commission_expr}"
         ws.cell(row=row_num, column=prowizja_suma_col).number_format = '#,##0.00'
         ws.cell(row=row_num, column=dodatkowe_zyski_col).value = None
         ws.cell(row=row_num, column=dodatkowe_zyski_col).number_format = '#,##0.00'
@@ -2778,6 +3163,7 @@ def export_to_excel_PL(
         suma_koszty_ref = f"{get_column_letter(costs_col + other_costs_offset + 1)}{row_num}"
         ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).value = f"={prowizja_ref}-{suma_koszty_ref}"
         ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).number_format = '#,##0.00'
+        profit_loss_by_device[device_id] = float(row_commission_total - all_costs_total)
         ws.cell(row=row_num, column=uwagi_col_idx).value = None
         row_num += 1
 
@@ -2832,49 +3218,109 @@ def export_to_excel_PL(
             ),
         )
     
-    # Dostosuj szerokość kolumn
-    for col in ws.columns:
-        max_length = 0
-        column = col[0].column_letter
-        for cell in col:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-        adjusted_width = min(max_length + 2, 50)
-        ws.column_dimensions[column].width = adjusted_width
-    
-    wb.save(filepath)
-    print(f"\n✓ Raport P&L eksportowany: {filepath}")
+    _format_worksheet_columns(ws)
+
+    if save_workbook and filepath is not None:
+        wb.save(filepath)
+        print(f"\n✓ Raport P&L eksportowany: {filepath}")
     print(f"✓ Liczba wierszy: {len(all_device_ids)}")
+    return {
+        'profit_loss_by_device': profit_loss_by_device,
+        'all_device_ids': all_device_ids,
+        'sheet_title': ws.title,
+        'workbook': wb,
+        'filepath': filepath,
+    }
 
 
-def _build_month_export_payload(conn, month_str, args, dictionary_comparison):
+def export_multi_month_PL(
+    dictionary_comparison,
+    month_payloads,
+    filename,
+    carriers=None,
+    costs_file=DEFAULT_COSTS_FILE,
+    rent_file=DEFAULT_RENT_FILE,
+    rent_sheet=None,
+    amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
+    amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
+):
+    """
+    Eksportuje wiele miesięcy do jednego skoroszytu oraz dodaje arkusz Profit/loss.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = OUTPUT_DIR / filename
+    wb = Workbook()
+
+    month_to_profit_loss = {}
+    month_to_commission_sum = {}
+    for month_str, payload in month_payloads:
+        commission_data = build_monthly_commission_data_from_rules(
+            payload.get('revenue_data') or {},
+            payload.get('commission_rules') or {},
+            month_str,
+        )
+        month_to_commission_sum[month_str] = sum(
+            float(entry.get('prowizja_zl', 0.0) or 0.0)
+            for entry in commission_data.values()
+        )
+
+        sheet_result = export_to_excel_PL(
+            dictionary_comparison,
+            payload['revenue_data'],
+            month_str,
+            filename=None,
+            commission_rules=payload.get('commission_rules') or {},
+            carriers=carriers,
+            location_by_device=payload.get('location_by_device') or {},
+            automat_type_by_device=payload.get('automat_type_by_device') or {},
+            costs_file=costs_file,
+            rent_file=rent_file,
+            rent_sheet=rent_sheet,
+            amortyzacja_file=amortyzacja_file,
+            amortyzacja_sheet=amortyzacja_sheet,
+            workbook=wb,
+            sheet_title=f"P&L {month_str}",
+            save_workbook=False,
+            service_cost_by_device=payload.get('service_cost_by_device') or {},
+        )
+        month_to_profit_loss[month_str] = sheet_result['profit_loss_by_device']
+
+    _create_profit_loss_summary_sheet(wb, month_to_profit_loss)
+    _create_commission_cumulative_sheet(wb, month_to_commission_sum)
+    wb.save(filepath)
+    print(f"\n✓ Raport P&L eksportowany (wieloarkuszowy): {filepath}")
+
+
+def _build_month_export_payload(conn, month_str, args, dictionary_comparison, revenue_data_override=None):
     """
     Buduje dane wejściowe do eksportu dla wskazanego miesiąca.
     """
-    if args.obrot_source_mode == 'carrier-transactions':
-        revenue_data = get_monthly_revenue_by_carrier(
-            conn,
-            month_str,
-            carriers=args.obrot_carriers,
-            table_name=args.obrot_transactions_table,
-            amount_col=args.obrot_transactions_amount_col,
-            date_col=args.obrot_transactions_date_col,
-            device_col=args.obrot_transactions_device_col,
-            payment_method_col=args.obrot_transactions_payment_method_col,
-            use_device_range_filter=not args.obrot_no_device_range_filter,
-        )
+    if revenue_data_override is not None:
+        revenue_data = revenue_data_override
     else:
-        revenue_data = get_monthly_revenue(
-            conn,
-            month_str,
-            schema=args.schema,
-            actioncodes=args.obrot_actioncodes,
-            mctype=args.obrot_mctype,
-            use_device_range_filter=not args.obrot_no_device_range_filter,
-        )
+        revenue_month_str = month_str
+
+        if args.obrot_source_mode == 'carrier-transactions':
+            revenue_data = get_monthly_revenue_by_carrier(
+                conn,
+                revenue_month_str,
+                carriers=args.obrot_carriers,
+                table_name=args.obrot_transactions_table,
+                amount_col=args.obrot_transactions_amount_col,
+                date_col=args.obrot_transactions_date_col,
+                device_col=args.obrot_transactions_device_col,
+                payment_method_col=args.obrot_transactions_payment_method_col,
+                use_device_range_filter=not args.obrot_no_device_range_filter,
+            )
+        else:
+            revenue_data = get_monthly_revenue(
+                conn,
+                revenue_month_str,
+                schema=args.schema,
+                actioncodes=args.obrot_actioncodes,
+                mctype=args.obrot_mctype,
+                use_device_range_filter=not args.obrot_no_device_range_filter,
+            )
 
     commission_rules, xlsx_location_by_device = load_commission_rules_and_locations_from_xlsx(
         month_str,
@@ -2912,11 +3358,28 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison):
         groupid_col='groupid',
     )
 
+    service_cost_by_device = {}
+    resolved_service_file = _resolve_service_file_for_month(month_str, args.serwis_file)
+    if resolved_service_file is not None:
+        service_location_map, service_cost_map = _load_service_overrides_from_xlsx(
+            service_file=resolved_service_file,
+            sheet_index=args.serwis_sheet_index,
+        )
+        for device_id, location in service_location_map.items():
+            if device_id in all_device_ids and location:
+                location_by_device[device_id] = location
+        service_cost_by_device = {
+            int(device_id): float(value or 0.0)
+            for device_id, value in service_cost_map.items()
+            if int(device_id) in all_device_ids
+        }
+
     return {
         'revenue_data': revenue_data,
         'commission_rules': commission_rules,
         'location_by_device': location_by_device,
         'automat_type_by_device': automat_type_by_device,
+        'service_cost_by_device': service_cost_by_device,
     }
 
 
@@ -3066,6 +3529,18 @@ def main():
         type=str,
         default=DEFAULT_AMORTYZACJA_SHEET,
         help='Nazwa arkusza z amortyzacją BB (domyślnie: bb8)'
+    )
+    parser.add_argument(
+        '--serwis-file',
+        type=str,
+        default=None,
+        help='Ścieżka do pliku Excel z override serwisu (Nr TVM, LOKALIZACJA, SERWIS KOSZT). Gdy brak, plik dobierany jest automatycznie po miesiącu.'
+    )
+    parser.add_argument(
+        '--serwis-sheet-index',
+        type=int,
+        default=DEFAULT_SERWIS_SHEET_INDEX,
+        help='Numer arkusza (1-based) w pliku serwisu (domyślnie: 4)'
     )
     parser.add_argument(
         '--output-naming',
@@ -3348,52 +3823,32 @@ def main():
     print(f"✓ Uzupełniono typ automatu dla {len(automat_type_by_device)} / {len(all_device_ids)} automatów")
 
     # === KROK 5: Eksport do Excel ===
-    print(f"\n[6/6] Eksport do Excel...")
+    print(f"\n[6/6] Eksport do Excel (wieloarkuszowy)...")
+    report_months = _build_commission_report_months()
+    month_payloads = []
+    for report_month in report_months:
+        report_month_revenue_override = revenue_data if report_month == month_str else None
+        payload = _build_month_export_payload(
+            conn,
+            report_month,
+            args,
+            dictionary_comparison,
+            revenue_data_override=report_month_revenue_override,
+        )
+        month_payloads.append((report_month, payload))
+
     filename = build_output_filename(month_str, naming_mode=args.output_naming)
-    export_to_excel_PL(
+    export_multi_month_PL(
         dictionary_comparison,
-        revenue_data,
-        month_str,
+        month_payloads,
         filename,
-        commission_rules=commission_rules,
         carriers=args.obrot_carriers,
-        location_by_device=location_by_device,
-        automat_type_by_device=automat_type_by_device,
         costs_file=args.koszty_file,
         rent_file=args.najem_file,
         rent_sheet=args.najem_sheet,
         amortyzacja_file=args.amortyzacja_file,
         amortyzacja_sheet=args.amortyzacja_sheet,
     )
-
-    report_year = int(month_str.split('-')[0])
-    january_month_str = f"{report_year}-01"
-    if january_month_str != month_str:
-        print(f"\n[EXTRA] Generowanie osobnego skoroszytu dla stycznia ({january_month_str})...")
-        january_payload = _build_month_export_payload(
-            conn,
-            january_month_str,
-            args,
-            dictionary_comparison,
-        )
-        january_filename = build_output_filename(january_month_str, naming_mode='default')
-        export_to_excel_PL(
-            dictionary_comparison,
-            january_payload['revenue_data'],
-            january_month_str,
-            january_filename,
-            commission_rules=january_payload['commission_rules'],
-            carriers=args.obrot_carriers,
-            location_by_device=january_payload['location_by_device'],
-            automat_type_by_device=january_payload['automat_type_by_device'],
-            costs_file=args.koszty_file,
-            rent_file=args.najem_file,
-            rent_sheet=args.najem_sheet,
-            amortyzacja_file=args.amortyzacja_file,
-            amortyzacja_sheet=args.amortyzacja_sheet,
-        )
-    else:
-        print("\n[EXTRA] Pominieto dodatkowy skoroszyt styczniowy (raport bazowy jest juz za styczen).")
 
     conn.close()
     
