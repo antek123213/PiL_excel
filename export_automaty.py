@@ -2088,13 +2088,156 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
         wb.close()
 
 
-def _load_service_overrides_from_xlsx(service_file=None, sheet_index=DEFAULT_SERWIS_SHEET_INDEX):
+def _load_elavon_from_costs_file(month_str, elavon_costs_file):
     """
-    Wczytuje lokalizację i koszt serwisu per automat z pliku Serwis AB.
-    Oczekiwane kolumny: Nr TVM, LOKALIZACJA, SERWIS KOSZT.
+    Wczytuje ELAVON z pliku P&L_2025.11.25_koszty_ROP 2025.xlsx:
+    - Szuka arkusza dla danego roku
+    - Czyta tabelę ELAVON z kolumnami: miesiąc, kwota, miesiąc, kwota, ...
+    - Dzieli kwotę przez liczbę automatów i przypisuje na urządzenie
+    Zwraca: {device_id: elavon_amount_per_device}
+    """
+    elavon_by_device = {}
+    if elavon_costs_file is None:
+        return elavon_by_device
+
+    elavon_path = Path(elavon_costs_file)
+    if not elavon_path.exists():
+        print(f"⚠ Brak pliku ELAVON: {elavon_path}")
+        return elavon_by_device
+
+    try:
+        year, month = month_str.split('-')
+        year = int(year)
+        month = int(month)
+    except (ValueError, IndexError):
+        print(f"⚠ Nieprawidłowy format miesiąca dla ELAVON: {month_str}")
+        return elavon_by_device
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(elavon_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku ELAVON: {e}")
+        return elavon_by_device
+
+    sheet_name = str(year)
+    if sheet_name not in wb.sheetnames:
+        print(f"⚠ Brak arkusza {sheet_name} w pliku ELAVON: {elavon_path.name}")
+        wb.close()
+        return elavon_by_device
+
+    ws = wb[sheet_name]
+    elavon_row = None
+    device_count_row = None
+
+    # Szukaj sekcji ELAVON
+    for r in range(1, min(ws.max_row, 100) + 1):
+        cell_value = ws.cell(r, 1).value
+        if cell_value and str(cell_value).strip().upper() == 'ELAVON':
+            elavon_row = r
+            break
+
+    if elavon_row is None:
+        print(f"⚠ Nie znaleziono sekcji ELAVON w arkuszu {sheet_name}")
+        wb.close()
+        return elavon_by_device
+
+    # Czytaj kolumy z miesiącami i kwotami (załóż: A=etykieta, B=miesiąc, C=kwota, D=miesiąc, E=kwota, ...)
+    elavon_amount = 0.0
+    for col_idx in range(2, ws.max_column + 1, 2):
+        month_cell = ws.cell(elavon_row, col_idx).value
+        amount_cell = ws.cell(elavon_row, col_idx + 1).value
+
+        month_str_check = str(month_cell or '').strip()
+        # Parsuj miesiąc (próbuj YYYY-MM lub MM.YYYY)
+        parsed_month = None
+        if '-' in month_str_check:
+            try:
+                parsed_year, parsed_month_no = month_str_check.split('-')
+                parsed_year = int(parsed_year)
+                parsed_month_no = int(parsed_month_no)
+                if parsed_year == year and parsed_month_no == month:
+                    elavon_amount = _as_float(amount_cell)
+                    break
+            except (ValueError, IndexError):
+                pass
+        elif '.' in month_str_check:
+            try:
+                parsed_month_no, parsed_year_str = month_str_check.split('.')
+                parsed_month_no = int(parsed_month_no)
+                parsed_year = int(parsed_year_str)
+                if parsed_year == year and parsed_month_no == month:
+                    elavon_amount = _as_float(amount_cell)
+                    break
+            except (ValueError, IndexError):
+                pass
+
+    # Szukaj liczby automatów (załóż wiersz poniżej z etykietą "liczba automatów" lub podobnie)
+    device_count = 0
+    for r in range(elavon_row + 1, min(elavon_row + 10, ws.max_row) + 1):
+        cell_label = ws.cell(r, 1).value
+        if cell_label and 'automat' in str(cell_label).lower():
+            # Czytaj ilość z kolumny odpowiadającej naszemu miesiącowi
+            for col_idx in range(2, ws.max_column + 1, 2):
+                month_cell = ws.cell(r, col_idx).value
+                count_cell = ws.cell(r, col_idx + 1).value
+                month_str_check = str(month_cell or '').strip()
+                try:
+                    if '-' in month_str_check:
+                        parsed_year, parsed_month_no = month_str_check.split('-')
+                        parsed_year, parsed_month_no = int(parsed_year), int(parsed_month_no)
+                    elif '.' in month_str_check:
+                        parsed_month_no, parsed_year_str = month_str_check.split('.')
+                        parsed_year, parsed_month_no = int(parsed_year_str), int(parsed_month_no)
+                    else:
+                        continue
+                    if parsed_year == year and parsed_month_no == month:
+                        device_count = int(_as_float(count_cell) or 0)
+                        break
+                except (ValueError, IndexError):
+                    pass
+            if device_count > 0:
+                break
+
+    wb.close()
+
+    if elavon_amount <= 0 or device_count <= 0:
+        if elavon_amount <= 0:
+            print(f"ℹ ELAVON dla {month_str}: kwota = 0 lub nie znaleziona")
+        if device_count <= 0:
+            print(f"ℹ ELAVON dla {month_str}: liczba automatów = 0 lub nie znaleziona")
+        return elavon_by_device
+
+    per_device_amount = elavon_amount / device_count
+    print(f"✓ ELAVON {month_str}: kwota={elavon_amount:.2f}, automaty={device_count}, per urządzenie={per_device_amount:.2f}")
+
+    # Zwróć mapę - będzie zastosowana per device w _get_monthly_costs_per_device
+    return {'_total': elavon_amount, '_count': device_count, '_per_device': per_device_amount}
+
+
+def _load_service_overrides_from_xlsx(service_file=None, sheet_index=DEFAULT_SERWIS_SHEET_INDEX, month_str=None):
+    """
+    Wczytuje koszt serwisu per automat z pliku Serwis.
+    Dla msc Jan-Mar 2026 czyta plik 'serwis od 2026.xlsx'.
+    Oczekiwane kolumny: Nr TVM, LOKALIZACJA, KOSZT SERWISU.
     """
     location_by_device = {}
     service_cost_by_device = {}
+    
+    # Jeśli month_str podany, sprawdzaj czy to Jan-Mar 2026
+    if month_str:
+        try:
+            year, month = month_str.split('-')
+            year, month = int(year), int(month)
+            # Tylko dla 2026-01, 2026-02, 2026-03
+            if not (year == 2026 and 1 <= month <= 3):
+                return location_by_device, service_cost_by_device
+            # Zmień filename na dynamiczny
+            if service_file is None:
+                service_file = Path(__file__).parent / 'Koszty' / f'serwis od {year}.xlsx'
+        except (ValueError, IndexError):
+            pass
+    
     if service_file is None:
         return location_by_device, service_cost_by_device
 
@@ -2232,7 +2375,10 @@ def _get_monthly_costs_per_device(
     )
 
     # Koszty TVM (sekcje w kolumnie B)
-    global_costs['elavon'] = _extract_monthly_value_in_section(ws, 'ELAVON', month_str)
+    # ELAVON jest ładowany posebnie z pliku P&L - będzie przypisany per device
+    # Tutaj zostawiamy 0, będzie nadpisane poniżej
+    global_costs['elavon'] = 0.0
+    
     global_costs['poczta_polska'] = _extract_monthly_value_in_section(ws, 'POCZTA POLSKA', month_str)
     global_costs['amortyzacja'] = _extract_monthly_value_in_section(ws, 'AMORTYZACJA', month_str)
     global_costs['papier'] = _extract_monthly_value_in_section(ws, 'PAPIER', month_str)
@@ -2289,12 +2435,21 @@ def _get_monthly_costs_per_device(
     costs_by_device = {}
     service_cost_by_device = service_cost_by_device or {}
 
+    # Ładuj ELAVON z pliku P&L - będzie przypisany per device
+    elavon_per_device_file = Path(__file__).parent / 'Koszty' / 'P&L_2025.11.25_koszty_ROP 2025.xlsx'
+    elavon_data = _load_elavon_from_costs_file(month_str, elavon_per_device_file)
+    elavon_per_device_amount = elavon_data.get('_per_device', 0.0)
+
     for device_id in normalized_ids:
         per_device = {}
         for key, value in global_costs.items():
-            if key == 'oh':
+            if key == 'elavon':
+                # ELAVON jest już per-device z pliku P&L
+                per_device[key] = elavon_per_device_amount
+            elif key == 'oh':
                 continue
-            per_device[key] = float(value or 0.0) / device_count
+            else:
+                per_device[key] = float(value or 0.0) / device_count
 
         rent_entry = rent_by_device.get(device_id, {})
         per_device['czynsz'] = float(rent_entry.get('czynsz', 0.0) or 0.0)
@@ -2949,7 +3104,6 @@ def export_to_excel_PL(
         headers.append(f"{PAYMENT_METHOD_LABELS['karta']} {label}")
         headers.append(f"{PAYMENT_METHOD_LABELS['blik']} {label}")
     headers.append('Brutto Suma')
-    headers.append('Transakcje bezgotówkowe Suma')
     headers.append('Prowizja Suma')
     headers.append('Dodatkowe zyski')
     headers.append('Netto Suma')
@@ -2966,7 +3120,6 @@ def export_to_excel_PL(
     headers.append('Karta Suma')
     headers.append('BLIK Suma')
     headers.append('Gotówka Suma')
-    headers.append('Transakcje bezgotówkowe')
     headers.append('Profit/loss')
     headers.append('UWAGI')
     result_col_idx = headers.index('Profit/loss') + 1
@@ -3084,12 +3237,10 @@ def export_to_excel_PL(
         total_col = col_idx
         ws.cell(row=row_num, column=total_col).value = row_total
         ws.cell(row=row_num, column=total_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=total_col + 1).value = carrier_cashless_total
-        ws.cell(row=row_num, column=total_col + 1).number_format = '#,##0.00'
 
-        prowizja_suma_col = total_col + 2
-        dodatkowe_zyski_col = total_col + 3
-        netto_suma_col = total_col + 4
+        prowizja_suma_col = total_col + 1
+        dodatkowe_zyski_col = total_col + 2
+        netto_suma_col = total_col + 3
         per_carrier_commission_refs = [
             f"{get_column_letter(4 + idx * 6 + 1)}{row_num}"
             for idx in range(len(carrier_order))
@@ -3103,10 +3254,9 @@ def export_to_excel_PL(
         ws.cell(row=row_num, column=netto_suma_col).number_format = '#,##0.00'
 
         cost_entry = dict(costs_by_device.get(device_id, {}))
-        it_card_value = 0.0
-        for carrier_code, carrier_cashless in carrier_cashless_by_code.items():
-            rate = IT_CARD_RATE_BY_CARRIER.get(carrier_code, DEFAULT_IT_CARD_RATE)
-            it_card_value += carrier_cashless * rate
+        # IT_CARD: 1.35% z (karta + blik)
+        cashless_total = card_total + blik_total
+        it_card_value = cashless_total * 0.0135
         cost_entry['it_card'] = it_card_value
 
         if automat_type == 'BB':
@@ -3122,7 +3272,7 @@ def export_to_excel_PL(
                 cost_entry['amortyzacja'] = 0.0
                 bb_missing += 1
 
-        costs_col = total_col + 5
+        costs_col = total_col + 4
         tvm_cost_sum = 0.0
         for key in TVM_COST_KEYS:
             val = float(cost_entry.get(key, 0.0) or 0.0)
@@ -3156,13 +3306,11 @@ def export_to_excel_PL(
         ws.cell(row=row_num, column=costs_col + other_costs_offset + 3).number_format = '#,##0.00'
         ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).value = cash_total
         ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).value = card_total + blik_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).number_format = '#,##0.00'
 
         prowizja_ref = f"{get_column_letter(prowizja_suma_col)}{row_num}"
         suma_koszty_ref = f"{get_column_letter(costs_col + other_costs_offset + 1)}{row_num}"
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).value = f"={prowizja_ref}-{suma_koszty_ref}"
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 6).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).value = f"={prowizja_ref}-{suma_koszty_ref}"
+        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).number_format = '#,##0.00'
         profit_loss_by_device[device_id] = float(row_commission_total - all_costs_total)
         ws.cell(row=row_num, column=uwagi_col_idx).value = None
         row_num += 1
@@ -3359,20 +3507,22 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
     )
 
     service_cost_by_device = {}
+    #  Serwis: jeśli nie znaleziono pliku per month, a to Jan-Mar 2026, to _load_service_overrides_from_xlsx
+    # sam spróbuje załadować z "serwis od 2026.xlsx"
     resolved_service_file = _resolve_service_file_for_month(month_str, args.serwis_file)
-    if resolved_service_file is not None:
-        service_location_map, service_cost_map = _load_service_overrides_from_xlsx(
-            service_file=resolved_service_file,
-            sheet_index=args.serwis_sheet_index,
-        )
-        for device_id, location in service_location_map.items():
-            if device_id in all_device_ids and location:
-                location_by_device[device_id] = location
-        service_cost_by_device = {
-            int(device_id): float(value or 0.0)
-            for device_id, value in service_cost_map.items()
-            if int(device_id) in all_device_ids
-        }
+    service_location_map, service_cost_map = _load_service_overrides_from_xlsx(
+        service_file=resolved_service_file,
+        sheet_index=args.serwis_sheet_index,
+        month_str=month_str,
+    )
+    for device_id, location in service_location_map.items():
+        if device_id in all_device_ids and location:
+            location_by_device[device_id] = location
+    service_cost_by_device = {
+        int(device_id): float(value or 0.0)
+        for device_id, value in service_cost_map.items()
+        if int(device_id) in all_device_ids
+    }
 
     return {
         'revenue_data': revenue_data,
