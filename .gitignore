@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Runtime caches
+snapshots/cache/
+
+# Local logs
+run.log
