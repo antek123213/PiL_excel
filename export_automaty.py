@@ -2,7 +2,7 @@
 import psycopg2
 from psycopg2 import sql
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
 from datetime import datetime, date
@@ -17,10 +17,15 @@ import unicodedata
 import os
 import sys
 import hashlib
+import builtins
 
 try:
-    sys.stdout.reconfigure(encoding='utf-8')
-    sys.stderr.reconfigure(encoding='utf-8')
+    stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    stderr_reconfigure = getattr(sys.stderr, 'reconfigure', None)
+    if callable(stdout_reconfigure):
+        stdout_reconfigure(encoding='utf-8')
+    if callable(stderr_reconfigure):
+        stderr_reconfigure(encoding='utf-8')
 except Exception:
     pass
 
@@ -29,8 +34,32 @@ def _silent_print(*args, **kwargs):
     return None
 
 
+def _resilient_print(*args, **kwargs):
+    """
+    Bezpieczny print dla konsol Windows z ograniczonym kodowaniem (np. cp1250).
+    Przy UnicodeEncodeError podmienia niedostepne znaki na odpowiedniki zastępcze.
+    """
+    try:
+        builtins.print(*args, **kwargs)
+        return
+    except UnicodeEncodeError:
+        pass
+
+    sep = kwargs.get('sep', ' ')
+    end = kwargs.get('end', '\n')
+    file_obj = kwargs.get('file', sys.stdout)
+    flush = kwargs.get('flush', False)
+
+    text = sep.join(str(arg) for arg in args)
+    encoding = getattr(file_obj, 'encoding', None) or 'utf-8'
+    safe_text = text.encode(encoding, errors='replace').decode(encoding, errors='replace')
+    builtins.print(safe_text, end=end, file=file_obj, flush=flush)
+
+
 if os.environ.get('PIL_SILENT', '').strip() == '1':
     print = _silent_print
+else:
+    print = _resilient_print
 
 # === KONFIGURACJA ===
 DB_CONFIG = {
@@ -53,10 +82,12 @@ DEFAULT_AMORTYZACJA_2025_FILE = Path(__file__).parent / 'Koszty' / 'amortyzacja_
 DEFAULT_AMORTYZACJA_2026_FILE = Path(__file__).parent / 'Koszty' / 'amortyzacja_26.xlsx'
 DEFAULT_AMORTYZACJA_FILE = DEFAULT_AMORTYZACJA_2026_FILE
 DEFAULT_PROWIZJE_FILE = Path(__file__).parent / 'Prowizje_AB.xlsx'
+DEFAULT_LISTA_AUTOMATOW_FILE = Path(__file__).parent / 'lista automatów.xlsx'
 DEFAULT_SERWIS_FILE = Path(__file__).parent / 'Koszty' / 'serwis_2026.xlsx'
 DEFAULT_IT_CARD_SWITCH_FILE = Path(__file__).parent / 'Koszty' / 'IT CARD.xlsx'
 DEFAULT_SERWIS_SHEET_INDEX = 4
 DEFAULT_AMORTYZACJA_SHEET = None
+LOCATION_CACHE_STRATEGY_VERSION = '2026-04-16'
 DEVICE_ID_RANGES = (
     (1101, 1141),
     (1201, 1299),
@@ -120,6 +151,7 @@ TVM_COST_KEYS = (
     'transmisja_danych',
     'serwis',
     'it_card',
+    'infolinia',
     'ubezpieczenie',
 )
 TVM_COST_LABELS = {
@@ -133,6 +165,7 @@ TVM_COST_LABELS = {
     'transmisja_danych': 'transmisja danych',
     'serwis': 'serwis',
     'it_card': 'IT card',
+    'infolinia': 'infolinia',
     'ubezpieczenie': 'ubezpieczenie',
 }
 OTHER_COST_KEYS = ('non_tvm', 'project_variable_costs', 'oh')
@@ -140,6 +173,12 @@ OTHER_COST_LABELS = {
     'non_tvm': 'NON TVM',
     'project_variable_costs': 'Project Variable Costs',
     'oh': 'OH',
+}
+ROP_EXCLUDED_DEVICE_IDS = {1276, *range(1279, 1286)}
+INFOLINIA_MONTHLY_COST = 2650.0
+INFOLINIA_START_MONTH = '2026-03'
+ADDITIONAL_PROFIT_RULES = {
+    ('2026-02', 1122): 4500.0,
 }
 TRANSACTIONS_DEVICE_COL_CANDIDATES = [
     'fin_nr_urz',
@@ -249,6 +288,31 @@ def _normalize_tvm_location_text(value):
     return normalized
 
 
+def _extract_station_name_from_tvm_abbreviation(value):
+    """
+    Wyciąga nazwę stacji z pola TVM Abbreviation.
+
+    Przykład:
+    1250_RADOMSKO -> Radomsko
+    """
+    if value is None:
+        return ''
+
+    normalized = unicodedata.normalize('NFKD', str(value).strip())
+    normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r'^\s*\d+\s*[_\-:\./ ]*', '', normalized)
+    normalized = normalized.strip(' _-:/\t\r\n')
+    if not normalized:
+        return ''
+
+    normalized = re.sub(r'[_\-]+', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    if not normalized:
+        return ''
+
+    return normalized.title()
+
+
 def _resolve_service_file_for_month(month_str, service_file=None):
     """
     Wybiera plik serwisu dla danego miesiąca.
@@ -273,6 +337,23 @@ def _resolve_service_file_for_month(month_str, service_file=None):
         if candidate.exists():
             return candidate
 
+    return None
+
+
+def _resolve_lista_automatow_file_for_month(month_str, lista_file=None):
+    """
+    Zwraca plik lista automatów dla roku 2025.
+    """
+    if lista_file is not None:
+        return Path(lista_file)
+
+    try:
+        year, _month = map(int, month_str.split('-'))
+    except (ValueError, IndexError):
+        return None
+
+    if year == 2025:
+        return DEFAULT_LISTA_AUTOMATOW_FILE
     return None
 
 
@@ -714,6 +795,7 @@ def _build_month_payload_cache_key(month_str, args, dictionary_comparison):
     Buduje stabilny klucz cache payloadu miesiąca na podstawie wejścia raportu.
     """
     cache_signature = {
+        'location_strategy_version': LOCATION_CACHE_STRATEGY_VERSION,
         'month_str': month_str,
         'obrot_source_mode': args.obrot_source_mode,
         'obrot_carriers': list(args.obrot_carriers or []),
@@ -726,6 +808,7 @@ def _build_month_payload_cache_key(month_str, args, dictionary_comparison):
         'obrot_mctype': args.obrot_mctype,
         'obrot_no_device_range_filter': bool(args.obrot_no_device_range_filter),
         'prowizja_file': str(args.prowizja_file),
+        'lista_automatow_file': str(args.lista_automatow_file),
         'serwis_file': str(args.serwis_file),
         'serwis_sheet_index': int(args.serwis_sheet_index),
         'it_card_file': str(args.it_card_file),
@@ -1638,6 +1721,56 @@ def _month_date_bounds(month_str):
     return start_dt.date(), end_dt.date()
 
 
+def _month_str_to_tuple(month_str):
+    """
+    Konwertuje miesiac YYYY-MM na tuple (year, month) do porownan.
+    """
+    year, month = map(int, month_str.split('-'))
+    return year, month
+
+
+def _month_gte(month_str, threshold_month_str):
+    """
+    Sprawdza czy miesiac YYYY-MM jest >= od wskazanego progu.
+    """
+    return _month_str_to_tuple(month_str) >= _month_str_to_tuple(threshold_month_str)
+
+
+def _get_additional_profit_value(month_str, device_id):
+    """
+    Zwraca dodatkowy zysk dla automatu i miesiaca wg recznych regul.
+    """
+    return float(ADDITIONAL_PROFIT_RULES.get((month_str, int(device_id)), 0.0) or 0.0)
+
+
+def _build_rop_eligible_device_ids(device_ids, commission_rules, month_str):
+    """
+    Wyznacza automaty liczace sie do podzialu kosztow ROP.
+
+    Warunki:
+    - automat jest na liscie analizowanych urzadzen,
+    - automat nie jest na liscie wykluczen,
+    - dla automatu istnieje przynajmniej jedna regula prowizji aktywna
+      w miesiacu raportowym.
+    """
+    month_start, month_end = _month_date_bounds(month_str)
+    candidate_ids = {int(device_id) for device_id in (device_ids or [])}
+    eligible_ids = set()
+
+    for (device_id, _carrier_code), rules in (commission_rules or {}).items():
+        device_id_int = int(device_id)
+        if device_id_int not in candidate_ids:
+            continue
+        if device_id_int in ROP_EXCLUDED_DEVICE_IDS:
+            continue
+
+        picked_rules = _pick_commission_rules_for_month(rules or [], month_start, month_end)
+        if picked_rules:
+            eligible_ids.add(device_id_int)
+
+    return eligible_ids
+
+
 def _days_in_month(month_str):
     """
     Zwraca liczbę dni w miesiącu raportowym.
@@ -1989,7 +2122,7 @@ def load_commission_rules_and_locations_from_xlsx(month_str, commission_file=DEF
                 ),
             )
             percent_col = _find_header_col(row_map, lambda k: 'PROCENTOWA' in k or 'PROCENT' in k)
-            location_col = _find_header_col(row_map, lambda k: 'TVMLOCATION1' in k)
+            location_col = _find_header_col(row_map, lambda k: 'TVMABBREVIATION' in k)
 
             if carrier_col and device_col and valid_from_col and valid_to_col and (fixed_col or percent_col):
                 candidate_header_row = r
@@ -2090,7 +2223,7 @@ def load_commission_rules_and_locations_from_xlsx(month_str, commission_file=DEF
         })
 
         raw_location = ws.cell(r, header_map['location_col']).value if header_map.get('location_col') else None
-        normalized_location = _normalize_tvm_location_text(raw_location)
+        normalized_location = _extract_station_name_from_tvm_abbreviation(raw_location)
         if (
             normalized_location
             and int(device_id) not in location_by_device
@@ -2695,6 +2828,87 @@ def _load_service_overrides_from_xlsx(service_file=None, sheet_index=DEFAULT_SER
         wb.close()
 
 
+def _load_lista_automatow_locations_from_xlsx(lista_file=None, month_str=None):
+    """
+    Wczytuje lokalizacje z pliku lista automatów.xlsx dla roku 2025.
+    Oczekiwane kolumny: Nr TVM, Nazwa stacji.
+    """
+    location_by_device = {}
+
+    if month_str:
+        try:
+            year, _month = map(int, month_str.split('-'))
+            if year != 2025:
+                return location_by_device
+            if lista_file is None:
+                lista_file = DEFAULT_LISTA_AUTOMATOW_FILE
+        except (ValueError, IndexError):
+            pass
+
+    if lista_file is None:
+        return location_by_device
+
+    lista_path = Path(lista_file)
+    if not lista_path.exists():
+        print(f"⚠ Brak pliku lista automatów: {lista_path}")
+        return location_by_device
+
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(lista_path, data_only=True, read_only=True)
+    except Exception as e:
+        print(f"⚠ Nie udało się odczytać pliku lista automatów: {e}")
+        return location_by_device
+
+    try:
+        for ws in wb.worksheets:
+            header_row = None
+            col_map = {}
+            scan_to = min(ws.max_row, 40)
+
+            for r in range(1, scan_to + 1):
+                row_map = {}
+                for c in range(1, ws.max_column + 1):
+                    token = _normalize_header_text(ws.cell(r, c).value)
+                    if token:
+                        row_map[token] = c
+
+                if not row_map:
+                    continue
+
+                nr_col = row_map.get('NRTVM') or row_map.get('NUMERATVM') or row_map.get('NRTVM')
+                station_col = row_map.get('NAZWASTACJI')
+                if nr_col and station_col:
+                    header_row = r
+                    col_map = {
+                        'nr_col': nr_col,
+                        'station_col': station_col,
+                    }
+                    break
+
+            if header_row is None:
+                continue
+
+            for r in range(header_row + 1, ws.max_row + 1):
+                raw_device = ws.cell(r, col_map['nr_col']).value
+                raw_station = ws.cell(r, col_map['station_col']).value
+                if raw_device is None and raw_station is None:
+                    continue
+
+                device_id = _parse_device_id(raw_device)
+                if device_id is None:
+                    continue
+
+                normalized_station = _normalize_tvm_location_text(raw_station)
+                if normalized_station and device_id not in location_by_device:
+                    location_by_device[device_id] = normalized_station
+
+        print(f"✓ Wczytano lista automatów 2025: lokalizacje={len(location_by_device)}")
+        return location_by_device
+    finally:
+        wb.close()
+
+
 def _get_monthly_costs_per_device(
     month_str,
     device_ids,
@@ -2703,10 +2917,11 @@ def _get_monthly_costs_per_device(
     rent_sheet=None,
     service_cost_by_device=None,
     it_card_switch_dates=None,
+    commission_rules=None,
 ):
     """
     Wczytuje koszty z pliku Excel i rozdziela je na automaty.
-    Dla kosztów globalnych stosuje równy podział na wszystkie automaty AB.
+    Dla kosztow globalnych stosuje podzial tylko na automaty liczace sie do ROP.
     """
     normalized_ids = sorted({int(device_id) for device_id in device_ids})
     if not normalized_ids:
@@ -2784,9 +2999,16 @@ def _get_monthly_costs_per_device(
         month_col=9,
         value_col=11,
     )
+    # Infolinia jest kosztem TVM, dzielonym na automaty ROP od 2026-03.
+    global_costs['infolinia'] = INFOLINIA_MONTHLY_COST if _month_gte(month_str, INFOLINIA_START_MONTH) else 0.0
     # OH będzie liczony per-device poniżej
 
-    device_count = len(normalized_ids)
+    rop_eligible_ids = _build_rop_eligible_device_ids(
+        normalized_ids,
+        commission_rules or {},
+        month_str,
+    )
+    rop_device_count = len(rop_eligible_ids)
     costs_by_device = {}
     service_cost_by_device = service_cost_by_device or {}
 
@@ -2797,6 +3019,10 @@ def _get_monthly_costs_per_device(
     elavon_days_by_device = {}
     total_elavon_days = 0.0
     for device_id in normalized_ids:
+        if device_id not in rop_eligible_ids:
+            elavon_days_by_device[device_id] = 0.0
+            continue
+
         it_card_ratio = _it_card_active_ratio_for_month(
             it_card_switch_dates.get(device_id),
             month_str,
@@ -2808,16 +3034,20 @@ def _get_monthly_costs_per_device(
 
     for device_id in normalized_ids:
         per_device = {}
+        is_rop_eligible = device_id in rop_eligible_ids
         for key, value in global_costs.items():
             if key == 'elavon':
-                if elavon_month_total > 0 and total_elavon_days > 0:
+                if is_rop_eligible and elavon_month_total > 0 and total_elavon_days > 0:
                     per_device[key] = float(elavon_month_total) * (elavon_days_by_device[device_id] / total_elavon_days)
                 else:
                     per_device[key] = 0.0
             elif key == 'oh':
                 continue
             else:
-                per_device[key] = float(value or 0.0) / device_count
+                if is_rop_eligible and rop_device_count > 0:
+                    per_device[key] = float(value or 0.0) / rop_device_count
+                else:
+                    per_device[key] = 0.0
 
         rent_entry = rent_by_device.get(device_id, {})
         per_device['czynsz'] = float(rent_entry.get('czynsz', 0.0) or 0.0)
@@ -2828,12 +3058,10 @@ def _get_monthly_costs_per_device(
         if device_id in service_cost_by_device:
             per_device['serwis'] = float(service_cost_by_device.get(device_id, 0.0) or 0.0)
         
-        # Calculate OH per device: (NON_TVM + Project_variable_costs + TVM_sum) * 0.2
-        tvm_sum = sum(float(per_device.get(key, 0.0) or 0.0) for key in TVM_COST_KEYS)
+        # OH = 0.2 * (NON TVM + Project Variable Costs)
         per_device['oh'] = (
             float(per_device.get('non_tvm', 0.0) or 0.0) +
-            float(per_device.get('project_variable_costs', 0.0) or 0.0) +
-            tvm_sum
+            float(per_device.get('project_variable_costs', 0.0) or 0.0)
         ) * 0.2
         
         costs_by_device[device_id] = per_device
@@ -2885,10 +3113,28 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     """
     ws = wb.create_sheet(title='ProfitLoss_Summary')
     ordered_months = sorted(month_to_profit_loss.keys())
-    headers = ['Nr aut.'] + [f"Profit/loss {_month_label_pl(m)}" for m in ordered_months] + ['Zestawienie roczne (+/-)']
+    headers = ['Nr Aut.'] + [f"Profit/loss {_month_label_pl(m)}" for m in ordered_months] + ['Zestawienie roczne (+/-)']
 
+    if ordered_months:
+        years = sorted({int(m.split('-')[0]) for m in ordered_months})
+        if len(years) == 1:
+            year_label = f"Rok {years[0]}"
+        else:
+            year_label = f"Lata {years[0]}-{years[-1]}"
+
+        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=len(headers))
+        year_cell = ws.cell(row=1, column=2)
+        year_cell.value = year_label
+        year_cell.font = Font(bold=True, color='FFFFFF', size=12)
+        year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        year_cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    ws.cell(row=1, column=1).value = ''
+    ws.cell(row=1, column=1).fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+
+    header_row = 2
     for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
+        cell = ws.cell(row=header_row, column=col_num)
         cell.value = header
         cell.font = Font(bold=True, color='FFFFFF')
         cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
@@ -2900,7 +3146,8 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
         for device_id in month_map.keys()
     })
 
-    row_num = 2
+    data_start_row = 3
+    row_num = data_start_row
     for device_id in all_device_ids:
         ws.cell(row=row_num, column=1).value = device_id
         monthly_sum = 0.0
@@ -2917,10 +3164,42 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
         row_num += 1
 
     last_data_row = row_num - 1
-    if last_data_row >= 2:
+    summary_row = row_num
+    ws.cell(row=summary_row, column=1).value = 'SUMA MIESIECZNA'
+    ws.cell(row=summary_row, column=1).alignment = Alignment(horizontal='left', vertical='center')
+
+    for col_idx in range(2, len(headers) + 1):
+        col_letter = get_column_letter(col_idx)
+        if last_data_row >= data_start_row:
+            ws.cell(row=summary_row, column=col_idx).value = f"=SUM({col_letter}{data_start_row}:{col_letter}{last_data_row})"
+        else:
+            ws.cell(row=summary_row, column=col_idx).value = 0.0
+        ws.cell(row=summary_row, column=col_idx).number_format = '#,##0.00'
+
+    ws.freeze_panes = 'B3'
+    ws.column_dimensions['A'].width = 14
+    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[2].height = 22
+
+    thin = Side(style='thin', color='D9D9D9')
+    table_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for r in range(header_row, summary_row + 1):
+        for c in range(1, len(headers) + 1):
+            ws.cell(row=r, column=c).border = table_border
+
+    for r in range(2, summary_row + 1):
+        ws.cell(row=r, column=1).font = Font(bold=True, size=14)
+
+    for c in range(1, len(headers) + 1):
+        summary_cell = ws.cell(row=summary_row, column=c)
+        summary_cell.fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+        if c != 1:
+            summary_cell.font = Font(bold=True)
+
+    if last_data_row >= data_start_row:
         first_value_col_letter = get_column_letter(2)
         last_value_col_letter = get_column_letter(len(headers))
-        summary_range = f"{first_value_col_letter}2:{last_value_col_letter}{last_data_row}"
+        summary_range = f"{first_value_col_letter}{data_start_row}:{last_value_col_letter}{last_data_row}"
 
         ws.conditional_formatting.add(
             summary_range,
@@ -3490,50 +3769,247 @@ def export_to_excel_PL(
         else:
             ws = wb.create_sheet()
 
-    ws.title = sheet_title or f"P&L {month_str}"
-    
-    # === NAGŁÓWKI ===
-    headers = ['Nr aut.', 'Lokalizacja automatu', 'Typ automatu']
+    assert ws is not None
+
+    ws.title = sheet_title or month_str
+
+    title_row = 1
+    header_row = 2
+    data_start_row = 3
+
+    title_fill = PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid')
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    data_fill = PatternFill(start_color='EDEDED', end_color='EDEDED', fill_type='solid')
+    number_block_fill = PatternFill(start_color='E6E6E6', end_color='E6E6E6', fill_type='solid')
+    summary_fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+
+    title_font = Font(bold=True, size=16)
+    header_font = Font(bold=True, color='FFFFFF')
+    base_font = Font(size=11)
+
+    thin_side = Side(style='thin', color='000000')
+    medium_side = Side(style='medium', color='000000')
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    def _set_cell_style(r, c, *, fill=None, font=None, alignment=None, border=None, number_format=None):
+        cell = ws.cell(row=r, column=c)
+        if fill is not None:
+            cell.fill = fill
+        if font is not None:
+            cell.font = font
+        if alignment is not None:
+            cell.alignment = alignment
+        if border is not None:
+            cell.border = border
+        if number_format is not None:
+            cell.number_format = number_format
+        return cell
+
+    def _carrier_header_label(code):
+        if str(code).upper() == 'KML':
+            return 'KMŁ'
+        return _display_carrier_label(code)
+
+    detected_carriers = []
+    detected_set = set()
+    for rev_entry in revenue_data.values():
+        by_carrier = rev_entry.get('by_carrier') if isinstance(rev_entry, dict) else None
+        if isinstance(by_carrier, dict):
+            for code in by_carrier.keys():
+                normalized_code = _normalize_carrier_code(code)
+                if normalized_code not in detected_set:
+                    detected_set.add(normalized_code)
+                    detected_carriers.append(normalized_code)
+
+    if not detected_carriers:
+        detected_carriers = list(carrier_order)
+
+    preferred_order = ['ARP', 'IC', 'KD', 'KML', 'KW', 'LKA', 'PR', 'SKM']
+    carrier_order = [code for code in preferred_order if code in detected_carriers]
+    carrier_order += [code for code in detected_carriers if code not in carrier_order]
+
+    num1_col = 1
+    info_nr_col = 2
+    info_loc_col = 3
+    info_start_col = info_nr_col
+    info_end_col = info_loc_col
+
+    num2_col = info_end_col + 1
+    carrier_start_col = num2_col + 1
+    carrier_columns = {}
+    col_cursor = carrier_start_col
     for code in carrier_order:
-        label = _display_carrier_label(code)
-        headers.append(f"Brutto {label}")
-        headers.append(f"Prowizja {label}")
-        headers.append(f"Netto {label}")
-        headers.append(f"{PAYMENT_METHOD_LABELS['gotowka']} {label}")
-        headers.append(f"{PAYMENT_METHOD_LABELS['karta']} {label}")
-        headers.append(f"{PAYMENT_METHOD_LABELS['blik']} {label}")
-    headers.append('Brutto Suma')
-    headers.append('Prowizja Suma')
-    headers.append('Interchange')
-    headers.append('Dodatkowe zyski')
-    headers.append('Netto Suma')
+        carrier_columns[code] = {
+            'start': col_cursor,
+            'brutto': col_cursor,
+            'prowizja': col_cursor + 1,
+            'netto': col_cursor + 2,
+            'gotowka': col_cursor + 3,
+            'karta': col_cursor + 4,
+            'blik': col_cursor + 5,
+            'end': col_cursor + 5,
+        }
+        col_cursor += 6
+    carrier_end_col = col_cursor - 1
+
+    num3_col = carrier_end_col + 1
+    przychody_start_col = num3_col + 1
+    przychody_cols = {
+        'prowizja_suma': przychody_start_col,
+        'interchange': przychody_start_col + 1,
+        'dodatkowe_zyski': przychody_start_col + 2,
+    }
+    przychody_end_col = przychody_start_col + 2
+
+    num4_col = przychody_end_col + 1
+    koszty_start_col = num4_col + 1
+    tvm_cost_cols = {}
+    col_cursor = koszty_start_col
+    for key in TVM_COST_KEYS:
+        tvm_cost_cols[key] = col_cursor
+        col_cursor += 1
+    koszty_tvm_col = col_cursor
+    col_cursor += 1
+    other_cost_cols = {}
+    for key in OTHER_COST_KEYS:
+        other_cost_cols[key] = col_cursor
+        col_cursor += 1
+    dodatkowe_koszty_col = col_cursor
+    koszty_end_col = dodatkowe_koszty_col
+
+    num5_col = koszty_end_col + 1
+    podsum_start_col = num5_col + 1
+    podsum_cols = {
+        'koszty': podsum_start_col,
+        'brutto_suma': podsum_start_col + 1,
+        'netto_suma': podsum_start_col + 2,
+        'karta_suma': podsum_start_col + 3,
+        'blik_suma': podsum_start_col + 4,
+        'gotowka_suma': podsum_start_col + 5,
+        'profit_loss': podsum_start_col + 6,
+    }
+    podsum_end_col = podsum_start_col + 6
+
+    num6_col = podsum_end_col + 1
+    uwagi_col_idx = num6_col + 1
+    result_col_idx = podsum_cols['profit_loss']
+
+    if info_start_col <= info_end_col:
+        ws.merge_cells(start_row=title_row, start_column=info_start_col, end_row=title_row, end_column=info_end_col)
+    ws.cell(row=title_row, column=info_start_col, value='INFO')
+    _set_cell_style(
+        title_row,
+        info_start_col,
+        fill=title_fill,
+        font=title_font,
+        alignment=Alignment(horizontal='center', vertical='center'),
+        border=thin_border,
+    )
+
+    if carrier_order:
+        for code in carrier_order:
+            start_col = carrier_columns[code]['start']
+            end_col = carrier_columns[code]['end']
+            ws.merge_cells(start_row=title_row, start_column=start_col, end_row=title_row, end_column=end_col)
+            ws.cell(row=title_row, column=start_col, value=_carrier_header_label(code))
+            _set_cell_style(
+                title_row,
+                start_col,
+                fill=title_fill,
+                font=title_font,
+                alignment=Alignment(horizontal='center', vertical='center'),
+                border=thin_border,
+            )
+
+    ws.merge_cells(start_row=title_row, start_column=przychody_start_col, end_row=title_row, end_column=przychody_end_col)
+    ws.cell(row=title_row, column=przychody_start_col, value='Przychody')
+    _set_cell_style(
+        title_row,
+        przychody_start_col,
+        fill=title_fill,
+        font=title_font,
+        alignment=Alignment(horizontal='center', vertical='center'),
+        border=thin_border,
+    )
+
+    ws.merge_cells(start_row=title_row, start_column=koszty_start_col, end_row=title_row, end_column=koszty_end_col)
+    ws.cell(row=title_row, column=koszty_start_col, value='KOSZTY')
+    _set_cell_style(
+        title_row,
+        koszty_start_col,
+        fill=title_fill,
+        font=title_font,
+        alignment=Alignment(horizontal='center', vertical='center'),
+        border=thin_border,
+    )
+
+    ws.merge_cells(start_row=title_row, start_column=podsum_start_col, end_row=title_row, end_column=podsum_end_col)
+    ws.cell(row=title_row, column=podsum_start_col, value='Podsumowanie')
+    _set_cell_style(
+        title_row,
+        podsum_start_col,
+        fill=title_fill,
+        font=title_font,
+        alignment=Alignment(horizontal='center', vertical='center'),
+        border=thin_border,
+    )
+
+    ws.cell(row=title_row, column=uwagi_col_idx, value='Uwagi')
+    _set_cell_style(
+        title_row,
+        uwagi_col_idx,
+        fill=title_fill,
+        font=title_font,
+        alignment=Alignment(horizontal='center', vertical='center'),
+        border=thin_border,
+    )
+
+    header_values = {
+        info_nr_col: 'Nr TVM',
+        info_loc_col: 'Lokalizacja automatu',
+        przychody_cols['prowizja_suma']: 'Prowizja Suma',
+        przychody_cols['interchange']: 'Interchange',
+        przychody_cols['dodatkowe_zyski']: 'Dodatkowe zyski',
+        koszty_tvm_col: 'Koszty TVM',
+        dodatkowe_koszty_col: 'Dodatkowe koszty',
+        podsum_cols['koszty']: 'Koszty',
+        podsum_cols['brutto_suma']: 'Brutto Suma',
+        podsum_cols['netto_suma']: 'Netto Suma',
+        podsum_cols['karta_suma']: 'Karta Suma',
+        podsum_cols['blik_suma']: 'BLIK Suma',
+        podsum_cols['gotowka_suma']: 'Gotówka Suma',
+        podsum_cols['profit_loss']: 'Profit/loss',
+        uwagi_col_idx: 'Uwagi',
+    }
+
+    for code in carrier_order:
+        label = _carrier_header_label(code)
+        cols = carrier_columns[code]
+        header_values[cols['brutto']] = f"Brutto {label}"
+        header_values[cols['prowizja']] = f"Prowizja {label}"
+        header_values[cols['netto']] = f"Netto {label}"
+        header_values[cols['gotowka']] = f"{PAYMENT_METHOD_LABELS['gotowka']} {label}"
+        header_values[cols['karta']] = f"{PAYMENT_METHOD_LABELS['karta']} {label}"
+        header_values[cols['blik']] = f"{PAYMENT_METHOD_LABELS['blik']} {label}"
 
     for key in TVM_COST_KEYS:
-        headers.append(TVM_COST_LABELS[key])
-    headers.append('Koszty TVM Suma')
-
+        header_values[tvm_cost_cols[key]] = TVM_COST_LABELS[key]
     for key in OTHER_COST_KEYS:
-        headers.append(OTHER_COST_LABELS[key])
-    headers.append('TOTAL other project costs')
-    headers.append('SUMA KOSZTY')
+        header_values[other_cost_cols[key]] = OTHER_COST_LABELS[key]
 
-    headers.append('Karta Suma')
-    headers.append('BLIK Suma')
-    headers.append('Gotówka Suma')
-    headers.append('Profit/loss')
-    headers.append('UWAGI')
-    result_col_idx = headers.index('Profit/loss') + 1
-    uwagi_col_idx = len(headers)
-    
-    for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.value = header
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-    
+    for col_num, header in header_values.items():
+        ws.cell(row=header_row, column=col_num, value=header)
+        _set_cell_style(
+            header_row,
+            col_num,
+            fill=header_fill,
+            font=header_font,
+            alignment=Alignment(horizontal='center', vertical='center'),
+            border=thin_border,
+        )
+
     # === DANE ===
-    row_num = 2
+    row_num = data_start_row
     location_by_device = location_by_device or {}
     automat_type_by_device = automat_type_by_device or {}
     # Upewnij się, że wszystkie klucze są integerami
@@ -3541,6 +4017,7 @@ def export_to_excel_PL(
         [int(k) for k in dictionary_comparison.keys()] + 
         [int(k) for k in revenue_data.keys()]
     ))
+    rop_eligible_ids = _build_rop_eligible_device_ids(all_device_ids, commission_rules, month_str)
     costs_by_device = _get_monthly_costs_per_device(
         month_str,
         all_device_ids,
@@ -3549,6 +4026,7 @@ def export_to_excel_PL(
         rent_sheet=rent_sheet,
         service_cost_by_device=service_cost_by_device,
         it_card_switch_dates=it_card_switch_dates,
+        commission_rules=commission_rules,
     )
     profit_loss_by_device = {}
     it_card_switch_dates = it_card_switch_dates or {}
@@ -3570,10 +4048,8 @@ def export_to_excel_PL(
                 if carrier_order:
                     rev_by_carrier = {carrier_order[0]: rev_entry}
 
-        ws.cell(row=row_num, column=1).value = device_id
-        ws.cell(row=row_num, column=2).value = lokalizacja
-        automat_type = str(automat_type_by_device.get(device_id, '') or '').strip().upper()
-        ws.cell(row=row_num, column=3).value = automat_type
+        ws.cell(row=row_num, column=info_nr_col, value=device_id)
+        ws.cell(row=row_num, column=info_loc_col, value=lokalizacja)
 
         row_total = 0.0
         row_commission_total = 0.0
@@ -3585,7 +4061,6 @@ def export_to_excel_PL(
         carrier_cashless_total = 0.0
         carrier_cashless_by_code = {}
         month_start, month_end = _month_date_bounds(month_str)
-        col_idx = 4
         for carrier_code in carrier_order:
             rev = rev_by_carrier.get(carrier_code)
             amount = 0.0
@@ -3610,47 +4085,44 @@ def export_to_excel_PL(
             picked_rules = _pick_commission_rules_for_month(rules_for_key, month_start, month_end)
             commission_amount = _commission_amount_from_rules(picked_rules, netto_amount)
 
-            ws.cell(row=row_num, column=col_idx).value = amount
-            ws.cell(row=row_num, column=col_idx).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 1).value = commission_amount
-            ws.cell(row=row_num, column=col_idx + 1).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 2).value = netto_amount
-            ws.cell(row=row_num, column=col_idx + 2).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 3).value = by_payment_method['gotowka']
-            ws.cell(row=row_num, column=col_idx + 3).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 4).value = by_payment_method['karta']
-            ws.cell(row=row_num, column=col_idx + 4).number_format = '#,##0.00'
-            ws.cell(row=row_num, column=col_idx + 5).value = by_payment_method['blik']
-            ws.cell(row=row_num, column=col_idx + 5).number_format = '#,##0.00'
+            cols = carrier_columns[carrier_code]
+            ws.cell(row=row_num, column=cols['brutto'], value=amount)
+            ws.cell(row=row_num, column=cols['brutto']).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=cols['prowizja'], value=commission_amount)
+            ws.cell(row=row_num, column=cols['prowizja']).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=cols['netto'], value=netto_amount)
+            ws.cell(row=row_num, column=cols['netto']).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=cols['gotowka'], value=by_payment_method['gotowka'])
+            ws.cell(row=row_num, column=cols['gotowka']).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=cols['karta'], value=by_payment_method['karta'])
+            ws.cell(row=row_num, column=cols['karta']).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=cols['blik'], value=by_payment_method['blik'])
+            ws.cell(row=row_num, column=cols['blik']).number_format = '#,##0.00'
             row_total += amount
             row_commission_total += commission_amount
             interchange_rate = INTERCHANGE_RATE_BY_CARRIER.get(carrier_code, 0.0)
             row_interchange_total += cashless_for_carrier * interchange_rate
             row_netto_total += netto_amount
 
-            col_idx += 6
-
-        total_col = col_idx
-        ws.cell(row=row_num, column=total_col).value = row_total
-        ws.cell(row=row_num, column=total_col).number_format = '#,##0.00'
-
-        prowizja_suma_col = total_col + 1
-        interchange_col = total_col + 2
-        dodatkowe_zyski_col = total_col + 3
-        netto_suma_col = total_col + 4
+        prowizja_suma_col = przychody_cols['prowizja_suma']
+        interchange_col = przychody_cols['interchange']
+        dodatkowe_zyski_col = przychody_cols['dodatkowe_zyski']
         per_carrier_commission_refs = [
-            f"{get_column_letter(4 + idx * 6 + 1)}{row_num}"
-            for idx in range(len(carrier_order))
+            f"{get_column_letter(carrier_columns[code]['prowizja'])}{row_num}"
+            for code in carrier_order
         ]
         sum_commission_expr = '+'.join(per_carrier_commission_refs) if per_carrier_commission_refs else '0'
-        ws.cell(row=row_num, column=prowizja_suma_col).value = f"={sum_commission_expr}"
+        ws.cell(row=row_num, column=prowizja_suma_col, value=f"={sum_commission_expr}")
         ws.cell(row=row_num, column=prowizja_suma_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=interchange_col).value = row_interchange_total
+        ws.cell(row=row_num, column=interchange_col, value=row_interchange_total)
         ws.cell(row=row_num, column=interchange_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=dodatkowe_zyski_col).value = None
+        additional_profit_value = _get_additional_profit_value(month_str, device_id)
+        ws.cell(
+            row=row_num,
+            column=dodatkowe_zyski_col,
+            value=additional_profit_value if additional_profit_value != 0.0 else None,
+        )
         ws.cell(row=row_num, column=dodatkowe_zyski_col).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=netto_suma_col).value = row_netto_total
-        ws.cell(row=row_num, column=netto_suma_col).number_format = '#,##0.00'
 
         cost_entry = dict(costs_by_device.get(device_id, {}))
         # IT CARD: 1.34% z (karta+blik), proporcjonalnie do dni po dacie przejścia.
@@ -3659,75 +4131,105 @@ def export_to_excel_PL(
         it_card_value = cashless_total * 0.0134 * it_card_ratio
         cost_entry['it_card'] = it_card_value
 
-        costs_col = total_col + 5
         tvm_cost_sum = 0.0
         for key in TVM_COST_KEYS:
             val = float(cost_entry.get(key, 0.0) or 0.0)
             tvm_cost_sum += val
-            ws.cell(row=row_num, column=costs_col).value = val
-            ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
-            costs_col += 1
+            ws.cell(row=row_num, column=tvm_cost_cols[key], value=val)
+            ws.cell(row=row_num, column=tvm_cost_cols[key]).number_format = '#,##0.00'
 
-        ws.cell(row=row_num, column=costs_col).value = tvm_cost_sum
-        ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
-        costs_col += 1
+        ws.cell(row=row_num, column=koszty_tvm_col, value=tvm_cost_sum)
+        ws.cell(row=row_num, column=koszty_tvm_col).number_format = '#,##0.00'
 
-        other_costs_offset = len(OTHER_COST_KEYS)
         other_total = 0.0
-        for offset, key in enumerate(OTHER_COST_KEYS):
+        for key in OTHER_COST_KEYS:
             val = float(cost_entry.get(key, 0.0) or 0.0)
             other_total += val
-            ws.cell(row=row_num, column=costs_col + offset).value = val
-            ws.cell(row=row_num, column=costs_col + offset).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=other_cost_cols[key], value=val)
+            ws.cell(row=row_num, column=other_cost_cols[key]).number_format = '#,##0.00'
 
         all_costs_total = tvm_cost_sum + other_total
 
-        ws.cell(row=row_num, column=costs_col + other_costs_offset).value = other_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 1).value = all_costs_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 1).number_format = '#,##0.00'
-
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 2).value = card_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 2).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 3).value = blik_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 3).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).value = cash_total
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 4).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=dodatkowe_koszty_col, value=other_total)
+        ws.cell(row=row_num, column=dodatkowe_koszty_col).number_format = '#,##0.00'
 
         prowizja_ref = f"{get_column_letter(prowizja_suma_col)}{row_num}"
         interchange_ref = f"{get_column_letter(interchange_col)}{row_num}"
-        suma_koszty_ref = f"{get_column_letter(costs_col + other_costs_offset + 1)}{row_num}"
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).value = f"={prowizja_ref}+{interchange_ref}-{suma_koszty_ref}"
-        ws.cell(row=row_num, column=costs_col + other_costs_offset + 5).number_format = '#,##0.00'
-        profit_loss_by_device[device_id] = float(row_commission_total + row_interchange_total - all_costs_total)
-        ws.cell(row=row_num, column=uwagi_col_idx).value = None
+        dodatkowe_zyski_ref = f"{get_column_letter(dodatkowe_zyski_col)}{row_num}"
+        suma_koszty_ref = f"{get_column_letter(podsum_cols['koszty'])}{row_num}"
+        ws.cell(row=row_num, column=podsum_cols['koszty'], value=all_costs_total)
+        ws.cell(row=row_num, column=podsum_cols['koszty']).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=podsum_cols['brutto_suma'], value=row_total)
+        ws.cell(row=row_num, column=podsum_cols['brutto_suma']).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=podsum_cols['netto_suma'], value=row_netto_total)
+        ws.cell(row=row_num, column=podsum_cols['netto_suma']).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=podsum_cols['karta_suma'], value=card_total)
+        ws.cell(row=row_num, column=podsum_cols['karta_suma']).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=podsum_cols['blik_suma'], value=blik_total)
+        ws.cell(row=row_num, column=podsum_cols['blik_suma']).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=podsum_cols['gotowka_suma'], value=cash_total)
+        ws.cell(row=row_num, column=podsum_cols['gotowka_suma']).number_format = '#,##0.00'
+        ws.cell(
+            row=row_num,
+            column=podsum_cols['profit_loss'],
+            value=f"={prowizja_ref}+{interchange_ref}+{dodatkowe_zyski_ref}-{suma_koszty_ref}",
+        )
+        ws.cell(row=row_num, column=podsum_cols['profit_loss']).number_format = '#,##0.00'
+        profit_loss_by_device[device_id] = float(row_commission_total + row_interchange_total + additional_profit_value - all_costs_total)
+        ws.cell(row=row_num, column=uwagi_col_idx, value=None if device_id in rop_eligible_ids else 'do sprawdzenia')
         row_num += 1
 
     last_data_row = row_num - 1
 
     if last_data_row >= 2:
         summary_row = row_num
-        ws.cell(row=summary_row, column=1).value = 'PODSUMOWANIE'
-        ws.cell(row=summary_row, column=2).value = None
-        ws.cell(row=summary_row, column=3).value = None
-        ws.cell(row=summary_row, column=uwagi_col_idx).value = None
+        ws.cell(row=summary_row, column=info_loc_col, value='PODSUMOWANIE')
+        ws.cell(row=summary_row, column=info_nr_col, value=None)
+        ws.cell(row=summary_row, column=uwagi_col_idx, value=None)
 
-        for col_num in range(4, uwagi_col_idx):
+        numeric_columns = []
+        for code in carrier_order:
+            cols = carrier_columns[code]
+            numeric_columns.extend([cols['brutto'], cols['prowizja'], cols['netto'], cols['gotowka'], cols['karta'], cols['blik']])
+        numeric_columns.extend([
+            przychody_cols['prowizja_suma'],
+            przychody_cols['interchange'],
+            przychody_cols['dodatkowe_zyski'],
+        ])
+        numeric_columns.extend(list(tvm_cost_cols.values()))
+        numeric_columns.append(koszty_tvm_col)
+        numeric_columns.extend(list(other_cost_cols.values()))
+        numeric_columns.append(dodatkowe_koszty_col)
+        numeric_columns.extend([
+            podsum_cols['koszty'],
+            podsum_cols['brutto_suma'],
+            podsum_cols['netto_suma'],
+            podsum_cols['karta_suma'],
+            podsum_cols['blik_suma'],
+            podsum_cols['gotowka_suma'],
+            podsum_cols['profit_loss'],
+        ])
+
+        for col_num in numeric_columns:
             col_letter = get_column_letter(col_num)
-            summary_cell = ws.cell(row=summary_row, column=col_num)
-            summary_cell.value = f"=SUM({col_letter}2:{col_letter}{last_data_row})"
+            summary_cell = ws.cell(
+                row=summary_row,
+                column=col_num,
+                value=f"=SUM({col_letter}{data_start_row}:{col_letter}{last_data_row})",
+            )
             summary_cell.number_format = '#,##0.00'
 
-        for col_num in range(1, uwagi_col_idx + 1):
+        for col_num in range(info_nr_col, uwagi_col_idx + 1):
             cell = ws.cell(row=summary_row, column=col_num)
             cell.font = Font(bold=True)
-            cell.fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+            cell.fill = summary_fill
+            cell.border = thin_border
 
         row_num += 1
 
     if last_data_row >= 2:
-        result_col_letter = ws.cell(row=1, column=result_col_idx).column_letter
-        result_range = f"{result_col_letter}2:{result_col_letter}{last_data_row}"
+        result_col_letter = get_column_letter(result_col_idx)
+        result_range = f"{result_col_letter}{data_start_row}:{result_col_letter}{last_data_row}"
         ws.conditional_formatting.add(
             result_range,
             CellIsRule(
@@ -3744,8 +4246,83 @@ def export_to_excel_PL(
                 fill=PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),
             ),
         )
-    
-    _format_worksheet_columns(ws)
+
+    for r in range(data_start_row, last_data_row + 1):
+        for c in range(info_nr_col, uwagi_col_idx + 1):
+            _set_cell_style(
+                r,
+                c,
+                fill=data_fill,
+                font=base_font,
+                alignment=Alignment(horizontal='center' if c != info_loc_col and c != uwagi_col_idx else 'left', vertical='center'),
+                border=thin_border,
+            )
+
+    block_end_row = last_data_row if last_data_row >= data_start_row else header_row
+    number_blocks = [
+        (num1_col, '1'),
+        (num2_col, '2'),
+        (num3_col, '3'),
+        (num4_col, '4'),
+        (num5_col, '5'),
+        (num6_col, '6'),
+    ]
+    for num_col, label in number_blocks:
+        ws.cell(row=title_row, column=num_col, value=label)
+        _set_cell_style(
+            title_row,
+            num_col,
+            fill=number_block_fill,
+            font=Font(bold=True, size=18),
+            alignment=Alignment(horizontal='center', vertical='center'),
+            border=Border(left=medium_side, right=medium_side, top=medium_side, bottom=medium_side),
+        )
+        ws.merge_cells(start_row=title_row, start_column=num_col, end_row=block_end_row, end_column=num_col)
+
+    ws.row_dimensions[title_row].height = 32
+    ws.row_dimensions[header_row].height = 22
+    for r in range(data_start_row, last_data_row + 1):
+        ws.row_dimensions[r].height = 19
+
+    ws.column_dimensions[get_column_letter(num1_col)].width = 4
+    ws.column_dimensions[get_column_letter(info_nr_col)].width = 10
+    ws.column_dimensions[get_column_letter(info_loc_col)].width = 42
+    ws.column_dimensions[get_column_letter(num2_col)].width = 4
+    for code in carrier_order:
+        cols = carrier_columns[code]
+        ws.column_dimensions[get_column_letter(cols['brutto'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['prowizja'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['netto'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['gotowka'])].width = 11
+        ws.column_dimensions[get_column_letter(cols['karta'])].width = 11
+        ws.column_dimensions[get_column_letter(cols['blik'])].width = 10
+    ws.column_dimensions[get_column_letter(num3_col)].width = 4
+    for col in [przychody_cols['prowizja_suma'], przychody_cols['interchange'], przychody_cols['dodatkowe_zyski']]:
+        ws.column_dimensions[get_column_letter(col)].width = 14
+    ws.column_dimensions[get_column_letter(num4_col)].width = 4
+    for col in list(tvm_cost_cols.values()) + [koszty_tvm_col] + list(other_cost_cols.values()) + [dodatkowe_koszty_col]:
+        ws.column_dimensions[get_column_letter(col)].width = 12
+    ws.column_dimensions[get_column_letter(num5_col)].width = 4
+    for col in podsum_cols.values():
+        ws.column_dimensions[get_column_letter(col)].width = 13
+    ws.column_dimensions[get_column_letter(num6_col)].width = 4
+    ws.column_dimensions[get_column_letter(uwagi_col_idx)].width = 22
+
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 100
+    ws.freeze_panes = f"{get_column_letter(info_end_col + 1)}{data_start_row}"
+    ws.print_options.horizontalCentered = False
+    ws.print_options.verticalCentered = False
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.page_margins.left = 0.7
+    ws.page_margins.right = 0.7
+    ws.page_margins.top = 0.75
+    ws.page_margins.bottom = 0.75
+    ws.page_margins.header = 0.3
+    ws.page_margins.footer = 0.3
 
     if save_workbook and filepath is not None:
         wb.save(filepath)
@@ -3779,18 +4356,7 @@ def export_multi_month_PL(
     wb = Workbook()
 
     month_to_profit_loss = {}
-    month_to_commission_sum = {}
     for month_str, payload in month_payloads:
-        commission_data = build_monthly_commission_data_from_rules(
-            payload.get('revenue_data') or {},
-            payload.get('commission_rules') or {},
-            month_str,
-        )
-        month_to_commission_sum[month_str] = sum(
-            float(entry.get('prowizja_zl', 0.0) or 0.0)
-            for entry in commission_data.values()
-        )
-
         sheet_result = export_to_excel_PL(
             dictionary_comparison,
             payload['revenue_data'],
@@ -3814,7 +4380,6 @@ def export_multi_month_PL(
         month_to_profit_loss[month_str] = sheet_result['profit_loss_by_device']
 
     _create_profit_loss_summary_sheet(wb, month_to_profit_loss)
-    _create_commission_cumulative_sheet(wb, month_to_commission_sum)
     wb.save(filepath)
     print(f"\n✓ Raport P&L eksportowany (wieloarkuszowy): {filepath}")
 
@@ -3866,6 +4431,32 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
         if int(device_id) in all_device_ids
     }
 
+    year = int(month_str.split('-')[0])
+    if year >= 2026:
+        resolved_service_file = _resolve_service_file_for_month(month_str, args.serwis_file)
+        service_location_map, service_cost_map = _load_service_overrides_from_xlsx(
+            service_file=resolved_service_file,
+            sheet_index=args.serwis_sheet_index,
+            month_str=month_str,
+        )
+        for device_id, location in service_location_map.items():
+            if device_id in all_device_ids and location:
+                location_by_device[device_id] = location
+        service_cost_by_device = {
+            int(device_id): float(value or 0.0)
+            for device_id, value in service_cost_map.items()
+            if int(device_id) in all_device_ids
+        }
+    elif year == 2025:
+        resolved_lista_file = _resolve_lista_automatow_file_for_month(month_str, args.lista_automatow_file)
+        lista_location_map = _load_lista_automatow_locations_from_xlsx(
+            lista_file=resolved_lista_file,
+            month_str=month_str,
+        )
+        for device_id, location in lista_location_map.items():
+            if device_id in all_device_ids and location:
+                location_by_device[device_id] = location
+
     missing_location_ids = [device_id for device_id in all_device_ids if device_id not in location_by_device]
     if missing_location_ids:
         fallback_location_by_device = get_locations_by_carrier(
@@ -3887,20 +4478,8 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
     )
 
     service_cost_by_device = {}
-    resolved_service_file = _resolve_service_file_for_month(month_str, args.serwis_file)
-    service_location_map, service_cost_map = _load_service_overrides_from_xlsx(
-        service_file=resolved_service_file,
-        sheet_index=args.serwis_sheet_index,
-        month_str=month_str,
-    )
-    for device_id, location in service_location_map.items():
-        if device_id in all_device_ids and location:
-            location_by_device[device_id] = location
-    service_cost_by_device = {
-        int(device_id): float(value or 0.0)
-        for device_id, value in service_cost_map.items()
-        if int(device_id) in all_device_ids
-    }
+    if year < 2026:
+        service_cost_by_device = {}
     it_card_switch_dates = {
         int(device_id): switch_date
         for device_id, switch_date in _load_it_card_switch_dates(args.it_card_file).items()
@@ -4033,6 +4612,12 @@ def main():
         type=str,
         default=str(DEFAULT_PROWIZJE_FILE),
         help='Ścieżka do pliku Excel z prowizjami i lokalizacjami (domyślnie: Prowizje_AB.xlsx)'
+    )
+    parser.add_argument(
+        '--lista-automatow-file',
+        type=str,
+        default=str(DEFAULT_LISTA_AUTOMATOW_FILE),
+        help='Ścieżka do pliku Excel z listą automatów i nazwami stacji (domyślnie: lista automatów.xlsx)'
     )
     parser.add_argument(
         '--koszty-file',
