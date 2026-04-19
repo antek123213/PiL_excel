@@ -83,11 +83,12 @@ DEFAULT_AMORTYZACJA_2026_FILE = Path(__file__).parent / 'Koszty' / 'amortyzacja_
 DEFAULT_AMORTYZACJA_FILE = DEFAULT_AMORTYZACJA_2026_FILE
 DEFAULT_PROWIZJE_FILE = Path(__file__).parent / 'Prowizje_AB.xlsx'
 DEFAULT_LISTA_AUTOMATOW_FILE = Path(__file__).parent / 'lista automatów.xlsx'
+DEFAULT_RELOKACJE_FILE = Path(__file__).parent / 'Relokacje AB.txt'
 DEFAULT_SERWIS_FILE = Path(__file__).parent / 'Koszty' / 'serwis_2026.xlsx'
 DEFAULT_IT_CARD_SWITCH_FILE = Path(__file__).parent / 'Koszty' / 'IT CARD.xlsx'
 DEFAULT_SERWIS_SHEET_INDEX = 4
 DEFAULT_AMORTYZACJA_SHEET = None
-LOCATION_CACHE_STRATEGY_VERSION = '2026-04-16'
+LOCATION_CACHE_STRATEGY_VERSION = '2026-04-19-relokacje-magazyn-rop-cleanup'
 DEVICE_ID_RANGES = (
     (1101, 1141),
     (1201, 1299),
@@ -174,7 +175,7 @@ OTHER_COST_LABELS = {
     'project_variable_costs': 'Project Variable Costs',
     'oh': 'OH',
 }
-ROP_EXCLUDED_DEVICE_IDS = {1276, *range(1279, 1286)}
+ROP_EXCLUDED_DEVICE_IDS = set()
 INFOLINIA_MONTHLY_COST = 2650.0
 INFOLINIA_START_MONTH = '2026-03'
 ADDITIONAL_PROFIT_RULES = {
@@ -809,6 +810,7 @@ def _build_month_payload_cache_key(month_str, args, dictionary_comparison):
         'obrot_no_device_range_filter': bool(args.obrot_no_device_range_filter),
         'prowizja_file': str(args.prowizja_file),
         'lista_automatow_file': str(args.lista_automatow_file),
+        'relokacje_file': str(args.relokacje_file),
         'serwis_file': str(args.serwis_file),
         'serwis_sheet_index': int(args.serwis_sheet_index),
         'it_card_file': str(args.it_card_file),
@@ -937,6 +939,14 @@ def _serialize_month_payload_for_cache(payload):
         it_card_switch_dates[str(int(device_id))] = (
             normalized_switch_date.isoformat() if normalized_switch_date else None
         )
+    relocation_active_device_ids = sorted(
+        int(device_id)
+        for device_id in (payload.get('relocation_active_device_ids') or set())
+    )
+    warehouse_device_ids = sorted(
+        int(device_id)
+        for device_id in (payload.get('warehouse_device_ids') or set())
+    )
     return {
         'revenue_data': revenue_data,
         'commission_rules': _encode_commission_rules_for_cache(payload.get('commission_rules') or {}),
@@ -944,6 +954,8 @@ def _serialize_month_payload_for_cache(payload):
         'automat_type_by_device': automat_type_by_device,
         'service_cost_by_device': service_cost_by_device,
         'it_card_switch_dates': it_card_switch_dates,
+        'relocation_active_device_ids': relocation_active_device_ids,
+        'warehouse_device_ids': warehouse_device_ids,
     }
 
 
@@ -979,6 +991,15 @@ def _deserialize_month_payload_from_cache(raw_payload):
         if parsed_date is not None:
             it_card_switch_dates[int(device_id)] = parsed_date
 
+    relocation_active_device_ids = {
+        int(device_id)
+        for device_id in (raw_payload.get('relocation_active_device_ids') or [])
+    }
+    warehouse_device_ids = {
+        int(device_id)
+        for device_id in (raw_payload.get('warehouse_device_ids') or [])
+    }
+
     commission_rules = _decode_commission_rules_from_cache(raw_payload.get('commission_rules') or [])
     return {
         'revenue_data': revenue_data,
@@ -987,6 +1008,8 @@ def _deserialize_month_payload_from_cache(raw_payload):
         'automat_type_by_device': automat_type_by_device,
         'service_cost_by_device': service_cost_by_device,
         'it_card_switch_dates': it_card_switch_dates,
+        'relocation_active_device_ids': relocation_active_device_ids,
+        'warehouse_device_ids': warehouse_device_ids,
     }
 
 
@@ -1019,6 +1042,8 @@ def load_month_payload_cache(month_str, args, dictionary_comparison):
         'automat_type_by_device',
         'service_cost_by_device',
         'it_card_switch_dates',
+        'relocation_active_device_ids',
+        'warehouse_device_ids',
     }
     if not required_keys.issubset(set(payload.keys())):
         print(f"WARN CACHE INVALID STRUCTURE ({month_str}): {cache_file}")
@@ -1721,6 +1746,114 @@ def _month_date_bounds(month_str):
     return start_dt.date(), end_dt.date()
 
 
+def _parse_relokacje_date_token(value):
+    """
+    Parsuje datę z pliku relokacji (np. 08.04.2024, 6/18/2025).
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+
+    formats = ('%d.%m.%Y', '%d-%m-%Y', '%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y')
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _load_relocations_for_month(month_str, relokacje_file=DEFAULT_RELOKACJE_FILE, device_ids=None):
+    """
+    Wczytuje relokacje z pliku tekstowego i zwraca aktywne wpisy dla miesiąca.
+    Zwraca tuple:
+      - location_by_device: {device_id: location}
+      - active_device_ids: set(device_id)
+    """
+    relokacje_path = Path(relokacje_file)
+    if not relokacje_path.exists():
+        print(f"WARN Brak pliku relokacji: {relokacje_path}")
+        return {}, set()
+
+    target_ids = {int(device_id) for device_id in (device_ids or [])}
+    month_start, month_end = _month_date_bounds(month_str)
+    parsed_rows = {}
+
+    with open(relokacje_path, 'r', encoding='utf-8', errors='replace') as f:
+        for idx, raw_line in enumerate(f, start=1):
+            line = str(raw_line or '').strip()
+            if not line:
+                continue
+
+            cleaned = re.sub(r'\([^)]*\)', '', line).strip()
+            match = re.match(r'^\s*(\d+)\s*-\s*(.+?)\s*$', cleaned)
+            if not match:
+                continue
+
+            device_id = int(match.group(1))
+            if target_ids and device_id not in target_ids:
+                continue
+
+            rest = match.group(2).strip()
+            marker_match = re.search(r'\b(od|do)\b', rest, flags=re.IGNORECASE)
+            location = rest
+            if marker_match:
+                location = rest[:marker_match.start()]
+            location = location.strip(' ,.;:-')
+            if not location:
+                print(f"WARN Relokacje: brak lokalizacji w linii {idx}: {line}")
+                continue
+
+            valid_from = None
+            valid_to = None
+            for token, token_date in re.findall(r'\b(od|do)\b\s*([0-9]{1,2}[./-][0-9]{1,2}[./-][0-9]{2,4})', rest, flags=re.IGNORECASE):
+                parsed_date = _parse_relokacje_date_token(token_date)
+                if parsed_date is None:
+                    continue
+                if token.lower() == 'od':
+                    valid_from = parsed_date
+                elif token.lower() == 'do':
+                    valid_to = parsed_date
+
+            if valid_from and valid_to and valid_from > valid_to:
+                print(f"WARN Relokacje: pomijam wpis z niepoprawnym zakresem dat (linia {idx}): {line}")
+                continue
+
+            parsed_rows.setdefault(device_id, []).append({
+                'location': location,
+                'valid_from': valid_from,
+                'valid_to': valid_to,
+            })
+
+    active_locations = {}
+    active_device_ids = set()
+    for device_id, rows in parsed_rows.items():
+        matched_rows = []
+        for row in rows:
+            valid_from = row.get('valid_from') or date.min
+            valid_to = row.get('valid_to') or date.max
+            if valid_from <= month_end and valid_to >= month_start:
+                matched_rows.append(row)
+
+        if not matched_rows:
+            continue
+
+        matched_rows.sort(
+            key=lambda row: (
+                row.get('valid_from') or date.min,
+                row.get('valid_to') or date.max,
+            )
+        )
+        best_row = matched_rows[-1]
+        active_locations[device_id] = best_row['location']
+        active_device_ids.add(device_id)
+
+    print(f"Wczytano aktywne relokacje dla {len(active_device_ids)} automatow ({month_str})")
+    return active_locations, active_device_ids
+
+
 def _month_str_to_tuple(month_str):
     """
     Konwertuje miesiac YYYY-MM na tuple (year, month) do porownan.
@@ -2340,6 +2473,24 @@ def _find_nr_automatu_header(ws):
     return None, None
 
 
+def _find_work_header_col(ws):
+    """
+    Zwraca indeks kolumny WORK (lub UWAGA) w obszarze nagłówka amortyzacji.
+    """
+    tokens = {
+        'WORK',
+        'UWAGA',
+        'UWAGI',
+    }
+    scan_to = min(ws.max_row, 120)
+    for r in range(1, scan_to + 1):
+        for c in range(1, ws.max_column + 1):
+            normalized = _normalize_amortyzacja_header_text(ws.cell(r, c).value)
+            if normalized in tokens:
+                return c
+    return None
+
+
 def _find_amortyzacja_month_col(ws, roman_month_label):
     """
     Zwraca (month_header_row, month_col) dla kolumny miesiąca rzymskiego.
@@ -2383,6 +2534,7 @@ def _load_amortyzacja_by_device_for_month(month_str):
     Wczytuje amortyzację per automat z plików amortyzacja_25/amortyzacja_26.
     """
     result = {}
+    warehouse_device_ids = set()
     conflicts = set()
     stats = {
         'rows_read': 0,
@@ -2393,15 +2545,15 @@ def _load_amortyzacja_by_device_for_month(month_str):
 
     roman_month_label = _roman_month_label(month_str)
     if not roman_month_label:
-        return result
+        return result, warehouse_device_ids
 
     amort_path = _resolve_amortyzacja_file_for_month(month_str)
     if amort_path is None:
         print(f"WARN Brak mapowania pliku amortyzacji dla miesiaca: {month_str}")
-        return result
+        return result, warehouse_device_ids
     if not amort_path.exists():
         print(f"WARN Brak pliku amortyzacji: {amort_path}")
-        return result
+        return result, warehouse_device_ids
 
     try:
         from openpyxl import load_workbook
@@ -2409,17 +2561,34 @@ def _load_amortyzacja_by_device_for_month(month_str):
         wb = load_workbook(amort_path, data_only=True, read_only=False)
     except Exception as e:
         print(f"WARN Nie udalo sie odczytac pliku amortyzacji: {e}")
-        return result
+        return result, warehouse_device_ids
 
     try:
-        for sheet_name in ('1', '2'):
-            if sheet_name not in wb.sheetnames:
-                print(f"WARN Brak arkusza amortyzacji: {sheet_name} w {amort_path.name}")
+        target_sheet_groups = [
+            ('bb8', ('bb8',)),
+            ('ST_40FA2000', ('ST_40FA2000', 'ST40_FAA2000')),
+        ]
+        resolved_sheet_names = []
+        available_by_lower = {str(sheet_name).strip().lower(): sheet_name for sheet_name in wb.sheetnames}
+
+        for canonical_name, aliases in target_sheet_groups:
+            resolved_name = None
+            for alias in aliases:
+                resolved_name = available_by_lower.get(alias.lower())
+                if resolved_name is not None:
+                    break
+
+            if resolved_name is None:
+                print(f"WARN Brak arkusza amortyzacji: {canonical_name} w {amort_path.name}")
                 continue
+            resolved_sheet_names.append(resolved_name)
+
+        for sheet_name in resolved_sheet_names:
 
             ws = wb[sheet_name]
             nr_header_row, nr_col = _find_nr_automatu_header(ws)
             month_header_row, month_col = _find_amortyzacja_month_col(ws, roman_month_label)
+            work_col = _find_work_header_col(ws)
 
             if nr_col is None or month_col is None:
                 print(
@@ -2460,6 +2629,22 @@ def _load_amortyzacja_by_device_for_month(month_str):
                     continue
 
                 result[device_id] = _as_float(raw_amount)
+
+                warehouse_detected = False
+                if work_col is not None:
+                    raw_work = ws.cell(r, work_col).value
+                    if 'MAGAZYN' in str(raw_work or '').strip().upper():
+                        warehouse_detected = True
+
+                if not warehouse_detected:
+                    for c in range(1, ws.max_column + 1):
+                        raw_value = ws.cell(r, c).value
+                        if isinstance(raw_value, str) and 'MAGAZYN' in raw_value.strip().upper():
+                            warehouse_detected = True
+                            break
+
+                if warehouse_detected:
+                    warehouse_device_ids.add(device_id)
     finally:
         wb.close()
 
@@ -2474,7 +2659,7 @@ def _load_amortyzacja_by_device_for_month(month_str):
         "Wczytano amortyzacje per automat: "
         f"{len(result)} (plik {amort_path.name}, miesiac {roman_month_label})"
     )
-    return result
+    return result, warehouse_device_ids
 
 
 def _resolve_sheet_name_by_month(wb, month_str, preferred_sheet=None):
@@ -2963,7 +3148,7 @@ def _get_monthly_costs_per_device(
         rent_file=rent_file,
         rent_sheet=rent_sheet,
     )
-    amortyzacja_by_device = _load_amortyzacja_by_device_for_month(month_str)
+    amortyzacja_by_device, _ = _load_amortyzacja_by_device_for_month(month_str)
 
     # Koszty TVM (sekcje w kolumnie B)
     global_costs['elavon'] = 0.0
@@ -3073,15 +3258,15 @@ def _format_worksheet_columns(ws):
     """
     Dostosowuje szerokości kolumn arkusza.
     """
-    for col in ws.columns:
+    for col_idx, col in enumerate(ws.iter_cols(1, ws.max_column), start=1):
         max_length = 0
-        column = col[0].column_letter
         for cell in col:
             try:
                 if len(str(cell.value)) > max_length:
                     max_length = len(str(cell.value))
             except Exception:
                 pass
+        column = get_column_letter(col_idx)
         ws.column_dimensions[column].width = min(max_length + 2, 50)
 
 
@@ -3116,18 +3301,28 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     headers = ['Nr Aut.'] + [f"Profit/loss {_month_label_pl(m)}" for m in ordered_months] + ['Zestawienie roczne (+/-)']
 
     if ordered_months:
-        years = sorted({int(m.split('-')[0]) for m in ordered_months})
-        if len(years) == 1:
-            year_label = f"Rok {years[0]}"
-        else:
-            year_label = f"Lata {years[0]}-{years[-1]}"
+        year_to_month_positions = {}
+        for month_idx, month_str in enumerate(ordered_months, start=2):
+            year = int(month_str.split('-')[0])
+            year_to_month_positions.setdefault(year, []).append(month_idx)
 
-        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=len(headers))
-        year_cell = ws.cell(row=1, column=2)
-        year_cell.value = year_label
-        year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-        year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
-        year_cell.alignment = Alignment(horizontal='center', vertical='center')
+        for year, columns in sorted(year_to_month_positions.items()):
+            start_col = min(columns)
+            end_col = max(columns)
+            if start_col == end_col:
+                year_cell = ws.cell(row=1, column=start_col)
+                year_cell.value = f"Rok {year}"
+                year_cell.font = Font(bold=True, color='FFFFFF', size=12)
+                year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+                year_cell.alignment = Alignment(horizontal='center', vertical='center')
+                continue
+
+            ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+            year_cell = ws.cell(row=1, column=start_col)
+            year_cell.value = f"Rok {year}"
+            year_cell.font = Font(bold=True, color='FFFFFF', size=12)
+            year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+            year_cell.alignment = Alignment(horizontal='center', vertical='center')
 
     ws.cell(row=1, column=1).value = ''
     ws.cell(row=1, column=1).fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
@@ -3225,37 +3420,6 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
                 fill=PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),
             ),
         )
-
-    _format_worksheet_columns(ws)
-
-
-def _create_commission_cumulative_sheet(wb, month_to_commission_sum):
-    """
-    Tworzy arkusz zestawienia prowizji miesięcznej i sumy skumulowanej.
-    """
-    ws = wb.create_sheet(title='Prowizja_Kumulacja')
-    ordered_months = sorted(month_to_commission_sum.keys())
-
-    headers = ['Miesiac', 'Prowizja suma', 'Prowizja skumulowana']
-    for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_num)
-        cell.value = header
-        cell.font = Font(bold=True, color='FFFFFF')
-        cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-
-    running_total = 0.0
-    row_num = 2
-    for month_str in ordered_months:
-        monthly_total = float(month_to_commission_sum.get(month_str, 0.0) or 0.0)
-        running_total += monthly_total
-
-        ws.cell(row=row_num, column=1).value = month_str
-        ws.cell(row=row_num, column=2).value = monthly_total
-        ws.cell(row=row_num, column=2).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=3).value = running_total
-        ws.cell(row=row_num, column=3).number_format = '#,##0.00'
-        row_num += 1
 
     _format_worksheet_columns(ws)
 
@@ -3701,7 +3865,7 @@ def get_monthly_revenue_by_carrier(
 
     return revenue_data
 
-
+ 
 # === EKSPORT DO EXCEL (KOLUMNY 1-2, RESZTA PLACEHOLDER) ===
 
 def export_to_excel_PL(
@@ -3723,6 +3887,8 @@ def export_to_excel_PL(
     save_workbook=True,
     service_cost_by_device=None,
     it_card_switch_dates=None,
+    relocation_active_device_ids=None,
+    warehouse_device_ids=None,
 ):
     """
     Eksportuje raport P&L do Excela.
@@ -3780,6 +3946,7 @@ def export_to_excel_PL(
     title_fill = PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid')
     header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
     data_fill = PatternFill(start_color='EDEDED', end_color='EDEDED', fill_type='solid')
+    warehouse_fill = PatternFill(start_color='D0D0D0', end_color='D0D0D0', fill_type='solid')
     number_block_fill = PatternFill(start_color='E6E6E6', end_color='E6E6E6', fill_type='solid')
     summary_fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
 
@@ -4012,6 +4179,9 @@ def export_to_excel_PL(
     row_num = data_start_row
     location_by_device = location_by_device or {}
     automat_type_by_device = automat_type_by_device or {}
+    relocation_active_device_ids = {int(device_id) for device_id in (relocation_active_device_ids or set())}
+    warehouse_device_ids = {int(device_id) for device_id in (warehouse_device_ids or set())}
+    row_to_device_id = {}
     # Upewnij się, że wszystkie klucze są integerami
     all_device_ids = sorted(set(
         [int(k) for k in dictionary_comparison.keys()] + 
@@ -4038,6 +4208,8 @@ def export_to_excel_PL(
             info = dictionary_comparison[device_id]
             data = info['data']
             lokalizacja = extract_city_name(data.get('description', ''))
+        if device_id in warehouse_device_ids:
+            lokalizacja = 'magazyn'
         
         rev_by_carrier = {}
         if device_id in revenue_data:
@@ -4050,6 +4222,7 @@ def export_to_excel_PL(
 
         ws.cell(row=row_num, column=info_nr_col, value=device_id)
         ws.cell(row=row_num, column=info_loc_col, value=lokalizacja)
+        row_to_device_id[row_num] = device_id
 
         row_total = 0.0
         row_commission_total = 0.0
@@ -4176,7 +4349,10 @@ def export_to_excel_PL(
         )
         ws.cell(row=row_num, column=podsum_cols['profit_loss']).number_format = '#,##0.00'
         profit_loss_by_device[device_id] = float(row_commission_total + row_interchange_total + additional_profit_value - all_costs_total)
-        ws.cell(row=row_num, column=uwagi_col_idx, value=None if device_id in rop_eligible_ids else 'do sprawdzenia')
+        if device_id in rop_eligible_ids or device_id in relocation_active_device_ids:
+            ws.cell(row=row_num, column=uwagi_col_idx, value=None)
+        else:
+            ws.cell(row=row_num, column=uwagi_col_idx, value='do sprawdzenia')
         row_num += 1
 
     last_data_row = row_num - 1
@@ -4248,11 +4424,16 @@ def export_to_excel_PL(
         )
 
     for r in range(data_start_row, last_data_row + 1):
+        device_id = row_to_device_id.get(r)
+        is_warehouse_row = device_id in warehouse_device_ids
         for c in range(info_nr_col, uwagi_col_idx + 1):
+            row_fill = data_fill
+            if is_warehouse_row and c not in {num1_col, num2_col, num3_col, num4_col, num5_col, num6_col}:
+                row_fill = warehouse_fill
             _set_cell_style(
                 r,
                 c,
-                fill=data_fill,
+                fill=row_fill,
                 font=base_font,
                 alignment=Alignment(horizontal='center' if c != info_loc_col and c != uwagi_col_idx else 'left', vertical='center'),
                 border=thin_border,
@@ -4376,6 +4557,8 @@ def export_multi_month_PL(
             save_workbook=False,
             service_cost_by_device=payload.get('service_cost_by_device') or {},
             it_card_switch_dates=payload.get('it_card_switch_dates') or {},
+            relocation_active_device_ids=payload.get('relocation_active_device_ids') or set(),
+            warehouse_device_ids=payload.get('warehouse_device_ids') or set(),
         )
         month_to_profit_loss[month_str] = sheet_result['profit_loss_by_device']
 
@@ -4425,11 +4608,21 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
         [int(k) for k in revenue_data.keys()]
     ))
 
+    relocation_location_by_device, relocation_active_device_ids = _load_relocations_for_month(
+        month_str,
+        relokacje_file=args.relokacje_file,
+        device_ids=all_device_ids,
+    )
+
     location_by_device = {
         int(device_id): location
         for device_id, location in xlsx_location_by_device.items()
         if int(device_id) in all_device_ids
     }
+
+    for device_id, location in relocation_location_by_device.items():
+        if device_id in all_device_ids and location:
+            location_by_device[device_id] = location
 
     year = int(month_str.split('-')[0])
     if year >= 2026:
@@ -4480,6 +4673,7 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
     service_cost_by_device = {}
     if year < 2026:
         service_cost_by_device = {}
+    _, warehouse_device_ids = _load_amortyzacja_by_device_for_month(month_str)
     it_card_switch_dates = {
         int(device_id): switch_date
         for device_id, switch_date in _load_it_card_switch_dates(args.it_card_file).items()
@@ -4493,6 +4687,8 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
         'automat_type_by_device': automat_type_by_device,
         'service_cost_by_device': service_cost_by_device,
         'it_card_switch_dates': it_card_switch_dates,
+        'relocation_active_device_ids': relocation_active_device_ids,
+        'warehouse_device_ids': warehouse_device_ids,
     }
 
 
@@ -4620,6 +4816,12 @@ def main():
         help='Ścieżka do pliku Excel z listą automatów i nazwami stacji (domyślnie: lista automatów.xlsx)'
     )
     parser.add_argument(
+        '--relokacje-file',
+        type=str,
+        default=str(DEFAULT_RELOKACJE_FILE),
+        help='Ścieżka do pliku relokacji (domyślnie: Relokacje AB.txt)'
+    )
+    parser.add_argument(
         '--koszty-file',
         type=str,
         default=str(DEFAULT_COSTS_FILE),
@@ -4675,9 +4877,9 @@ def main():
     )
     parser.add_argument(
         '--month-payload-source',
-        choices=['auto', 'fresh', 'cache-only'],
+        choices=['auto', 'fresh', 'cache-only', 'no-cache'],
         default='auto',
-        help='Źródło payloadu miesięcznego: auto (cache z fallback), fresh (pełne pobranie), cache-only (tylko cache)'
+        help='Źródło payloadu miesięcznego: auto (cache z fallback), fresh (pełne pobranie), cache-only (tylko cache), no-cache (pełne pobranie bez odczytu cache)'
     )
     parser.add_argument(
         '--validate-provision-only',
@@ -4810,8 +5012,8 @@ def main():
                 return
 
     if current_month_payload is None:
-        if args.month_payload_source == 'fresh':
-            print(f"CACHE BYPASS {month_str}: tryb fresh")
+        if args.month_payload_source in ('fresh', 'no-cache'):
+            print(f"CACHE BYPASS {month_str}: tryb {args.month_payload_source}")
 
         current_month_payload = _build_month_export_payload(
             conn,
@@ -4821,7 +5023,7 @@ def main():
             revenue_data_override=None,
         )
 
-        if args.month_payload_source in ('auto', 'fresh'):
+        if args.month_payload_source in ('auto', 'fresh', 'no-cache'):
             save_month_payload_cache(month_str, args, dictionary_comparison, current_month_payload)
 
     revenue_data = current_month_payload.get('revenue_data') or {}
@@ -4901,6 +5103,8 @@ def main():
                     return
 
         if payload is None:
+            if args.month_payload_source in ('fresh', 'no-cache'):
+                print(f"CACHE BYPASS {report_month}: tryb {args.month_payload_source}")
             payload = _build_month_export_payload(
                 conn,
                 report_month,
@@ -4908,7 +5112,7 @@ def main():
                 dictionary_comparison,
                 revenue_data_override=None,
             )
-            if args.month_payload_source in ('auto', 'fresh'):
+            if args.month_payload_source in ('auto', 'fresh', 'no-cache'):
                 save_month_payload_cache(report_month, args, dictionary_comparison, payload)
 
         month_payloads.append((report_month, payload))
