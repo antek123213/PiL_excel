@@ -1,4 +1,3 @@
-# export_automaty.py - Miesięczne zestawienie TVM P&L (ETAP 1: kolumny 1-INFO, 2-OBRÓT, 3-PROWIZJA)
 import psycopg2
 from psycopg2 import sql
 from openpyxl import Workbook
@@ -18,6 +17,7 @@ import os
 import sys
 import hashlib
 import builtins
+import shutil
 
 try:
     stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
@@ -91,7 +91,9 @@ DEFAULT_AMORTYZACJA_SHEET = None
 LOCATION_CACHE_STRATEGY_VERSION = '2026-04-19-relokacje-magazyn-rop-cleanup'
 DEVICE_ID_RANGES = (
     (1101, 1141),
-    (1201, 1299),
+    (1201, 1275),
+    (1277, 1278),
+    (1286, 1299)
 )
 
 CARRIERS = ['ARP', 'IC', 'KD', 'KML', 'KW', 'LKA', 'PR', 'SKM']
@@ -113,6 +115,9 @@ TRANSACTIONS_DEVICE_COL_OVERRIDES = {
 TRANSACTIONS_AMOUNT_COL_OVERRIDES = {
 }
 TRANSACTIONS_PAYMENT_METHOD_COL_OVERRIDES = {
+}
+TRANSACTIONS_TICKET_COL = 'fin_l_bil'
+TRANSACTIONS_TICKET_COL_OVERRIDES = {
 }
 TRANSACTIONS_PAYMENT_METHOD_COL_CANDIDATES = [
     'fin_spos_opl',
@@ -778,6 +783,23 @@ def load_previous_snapshot(month_str):
     return None
 
 
+def load_snapshot(month_str):
+    """
+    Laduje snapshot dictionary dla wskazanego miesiaca.
+    """
+    snapshot_file = SNAPSHOT_DIR / f'dictionary_{month_str}.json'
+    if not snapshot_file.exists():
+        return None
+
+    with open(snapshot_file, 'r', encoding='utf-8') as f:
+        raw_snapshot = json.load(f)
+
+    return {
+        int(device_id): data
+        for device_id, data in raw_snapshot.items()
+    }
+
+
 def save_snapshot(snapshot, month_str):
     """
     Zapisuje snapshot dictionary do pliku JSON.
@@ -1133,6 +1155,146 @@ def _build_commission_report_months():
     """
     prev_month = (datetime.now().replace(day=1) - relativedelta(months=1)).strftime('%Y-%m')
     return list(_iter_months('2025-01', prev_month))
+
+
+def _validate_month_format(month_str):
+    """
+    Sprawdza format miesiąca YYYY-MM.
+    """
+    try:
+        datetime.strptime(str(month_str), '%Y-%m')
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _build_month_range(start_month_str, end_month_str):
+    """
+    Buduje zakres miesiecy w formacie YYYY-MM (wlacznie).
+    """
+    if not start_month_str or not end_month_str:
+        return []
+    return list(_iter_months(start_month_str, end_month_str))
+
+
+def build_summary_output_filename(start_month_str, end_month_str, device_ids=None):
+    """
+    Buduje nazwe pliku dla osobnego zestawienia.
+    """
+    device_part = ''
+    if device_ids:
+        device_part = '_' + '-'.join(str(int(device_id)) for device_id in sorted({int(device_id) for device_id in device_ids}))
+    return f"PL_SUMMARY{device_part}_{start_month_str}_{end_month_str}.xlsx"
+
+
+def _find_latest_pl_workbook(output_dir=OUTPUT_DIR):
+    """
+    Zwraca najnowszy plik P&L z katalogu output.
+    """
+    candidates = [
+        path for path in output_dir.glob('PL_TVM_*.xlsx')
+        if not path.name.upper().startswith('PL_SUMMARY')
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _extract_summary_rows_from_pl_workbook(workbook_path, device_ids, start_month_str, end_month_str):
+    """
+    Czyta gotowy plik P&L i wyciąga z niego kolumny potrzebne do zestawienia.
+    """
+    from openpyxl import load_workbook
+
+    target_ids = {int(device_id) for device_id in (device_ids or [])}
+    if not target_ids:
+        return []
+
+    try:
+        wb = load_workbook(workbook_path, read_only=True, data_only=True)
+    except Exception as exc:
+        try:
+            temp_copy_path = Path(workbook_path).with_name(f"{Path(workbook_path).stem}_copy_for_summary.xlsx")
+            shutil.copy2(workbook_path, temp_copy_path)
+            wb = load_workbook(temp_copy_path, read_only=True, data_only=True)
+        except Exception as copy_exc:
+            print(f"WARN Nie można odczytać workbooka źródłowego: {exc}")
+            print(f"WARN Nie udało się też otworzyć kopii roboczej: {copy_exc}")
+            return []
+
+    rows = []
+    for sheet_name in wb.sheetnames:
+        if not sheet_name.startswith('P&L '):
+            continue
+
+        month_str = sheet_name.replace('P&L ', '', 1).strip()
+        if month_str < start_month_str or month_str > end_month_str:
+            continue
+
+        ws = wb[sheet_name]
+        header_row = 2
+        header_map = {}
+        for col_idx in range(1, ws.max_column + 1):
+            header_value = ws.cell(row=header_row, column=col_idx).value
+            normalized_header = _normalize_header_text(header_value)
+            if normalized_header:
+                header_map[normalized_header] = col_idx
+
+        device_col = header_map.get('NRTVM') or header_map.get('NRAUTOMATU')
+        koszty_col = header_map.get('KOSZTY')
+        # W przychodach używamy prowizji (preferencyjnie kolumna "Prowizja Suma") + Interchange.
+        przychody_col = header_map.get('PROWIZJASUMA') or header_map.get('PROWIZJA')
+        interchange_col = header_map.get('INTERCHANGE')
+        profit_loss_col = header_map.get('PROFITLOSS') or header_map.get('PROFITLOSSF')
+
+        if (
+            device_col is None
+            or koszty_col is None
+            or przychody_col is None
+            or interchange_col is None
+            or profit_loss_col is None
+        ):
+            continue
+
+        device_col = int(device_col)
+        koszty_col = int(koszty_col)
+        przychody_col = int(przychody_col)
+        interchange_col = int(interchange_col)
+        profit_loss_col = int(profit_loss_col)
+
+        for row_idx in range(3, ws.max_row + 1):
+            device_value = ws.cell(row=row_idx, column=device_col).value
+            if device_value in (None, 'PODSUMOWANIE'):
+                break
+
+            device_id = _parse_device_id(device_value)
+            if device_id is None or device_id not in target_ids:
+                continue
+
+            prowizja_value = ws.cell(row=row_idx, column=przychody_col).value
+            interchange_value = ws.cell(row=row_idx, column=interchange_col).value
+            koszty_value = ws.cell(row=row_idx, column=koszty_col).value
+            profit_loss_value = ws.cell(row=row_idx, column=profit_loss_col).value
+
+            if isinstance(prowizja_value, str) and prowizja_value.startswith('='):
+                prowizja_value = None
+            if isinstance(interchange_value, str) and interchange_value.startswith('='):
+                interchange_value = None
+            if isinstance(koszty_value, str) and koszty_value.startswith('='):
+                koszty_value = None
+            if isinstance(profit_loss_value, str) and profit_loss_value.startswith('='):
+                profit_loss_value = None
+
+            przychody_total = _as_float(prowizja_value) + _as_float(interchange_value)
+            rows.append({
+                'miesiac': month_str,
+                'device_id': device_id,
+                'koszty': _as_float(koszty_value),
+                'przychody': przychody_total,
+                'profit_loss': _as_float(profit_loss_value) if _has_nonempty_value(profit_loss_value) else (przychody_total - _as_float(koszty_value)),
+            })
+
+    return rows
 
 
 def _forecast_source_month_for_2026(month_str):
@@ -1680,7 +1842,9 @@ def _normalize_header_text(value):
     """
     if value is None:
         return ''
-    return re.sub(r'[^A-Z0-9]+', '', str(value).strip().upper())
+    normalized = unicodedata.normalize('NFKD', str(value).strip().upper())
+    normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r'[^A-Z0-9]+', '', normalized)
 
 
 def _normalize_text_for_match(value):
@@ -1697,7 +1861,13 @@ def _build_month_year_labels(month_str):
     Zwraca etykiety miesiąca w formatach użytecznych do wyszukiwania nagłówków.
     """
     dt = datetime.strptime(month_str, '%Y-%m')
-    return dt.strftime('%m/%Y'), dt.strftime('%m%Y')
+    return {
+        'slash_padded': dt.strftime('%m/%Y'),
+        'compact_padded': dt.strftime('%m%Y'),
+        'slash_unpadded': f"{dt.month}/{dt.year}",
+        'compact_unpadded': f"{dt.month}{dt.year}",
+        'year_month_compact': f"{dt.year}{dt.month:02d}",
+    }
 
 
 def _parse_device_id(value):
@@ -2729,57 +2899,82 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
         return {}
 
     try:
-        ws = wb[sheet_name]
-        month_label_slash, month_label_compact = _build_month_year_labels(month_str)
+        month_labels = _build_month_year_labels(month_str)
+        month_label_slash = month_labels['slash_padded']
+
+        month_variants = {
+            month_labels['slash_padded'],
+            month_labels['compact_padded'],
+            month_labels['slash_unpadded'],
+            month_labels['compact_unpadded'],
+            month_labels['year_month_compact'],
+        }
+
+        normalized_month_variants = {
+            _normalize_header_text(label)
+            for label in month_variants
+            if label
+        }
 
         header_row = None
         device_col = None
         czynsz_col = None
         prad_col = None
+        header_sheet_name = None
 
-        czynsz_targets = {
-            _normalize_header_text(f"Czynsz {month_label_slash}"),
-            _normalize_header_text(f"Czynsz{month_label_slash}"),
-            _normalize_header_text(f"Czynsz {month_label_compact}"),
-            _normalize_header_text(f"Czynsz{month_label_compact}"),
-        }
-        prad_targets = {
-            _normalize_header_text(f"Energia {month_label_slash}"),
-            _normalize_header_text(f"Energia{month_label_slash}"),
-            _normalize_header_text(f"Energia {month_label_compact}"),
-            _normalize_header_text(f"Energia{month_label_compact}"),
-            _normalize_header_text(f"Prad {month_label_slash}"),
-            _normalize_header_text(f"Prad{month_label_slash}"),
-            _normalize_header_text(f"Prad {month_label_compact}"),
-            _normalize_header_text(f"Prad{month_label_compact}"),
-        }
+        czynsz_targets = set()
+        for month_label in normalized_month_variants:
+            czynsz_targets.add(_normalize_header_text(f"Czynsz {month_label}"))
+            czynsz_targets.add(_normalize_header_text(f"Czynsz{month_label}"))
 
-        scan_to = min(ws.max_row, 60)
-        for r, row_values in enumerate(
-            ws.iter_rows(min_row=1, max_row=scan_to, values_only=True),
-            start=1,
-        ):
-            row_device_col = None
-            row_czynsz_col = None
-            row_prad_col = None
+        prad_targets = set()
+        for month_label in normalized_month_variants:
+            for prefix in ('Energia', 'Prad'):
+                prad_targets.add(_normalize_header_text(f"{prefix} {month_label}"))
+                prad_targets.add(_normalize_header_text(f"{prefix}{month_label}"))
 
-            for c, raw_header in enumerate(row_values, start=1):
-                normalized_header = _normalize_header_text(raw_header)
-                if not normalized_header:
-                    continue
+        def _find_rent_columns(worksheet):
+            scan_to = min(worksheet.max_row, 200)
+            for r, row_values in enumerate(
+                worksheet.iter_rows(min_row=1, max_row=scan_to, values_only=True),
+                start=1,
+            ):
+                row_device_col = None
+                row_czynsz_col = None
+                row_prad_col = None
 
-                if normalized_header == 'NRAUTOMATU':
-                    row_device_col = c
-                if normalized_header in czynsz_targets:
-                    row_czynsz_col = c
-                if normalized_header in prad_targets:
-                    row_prad_col = c
+                for c, raw_header in enumerate(row_values, start=1):
+                    normalized_header = _normalize_header_text(raw_header)
+                    if not normalized_header:
+                        continue
 
-            if row_device_col and row_czynsz_col and row_prad_col:
-                header_row = r
-                device_col = row_device_col
-                czynsz_col = row_czynsz_col
-                prad_col = row_prad_col
+                    if normalized_header == 'NRAUTOMATU':
+                        row_device_col = c
+                    if normalized_header in czynsz_targets:
+                        row_czynsz_col = c
+                    if normalized_header in prad_targets:
+                        row_prad_col = c
+
+                if row_device_col and row_czynsz_col and row_prad_col:
+                    return r, row_device_col, row_czynsz_col, row_prad_col
+
+            return None, None, None, None
+
+        sheet_candidates = [sheet_name]
+        if not rent_sheet:
+            sheet_candidates.extend(name for name in wb.sheetnames if name != sheet_name)
+
+        ws = None
+        for candidate_sheet_name in sheet_candidates:
+            candidate_ws = wb[candidate_sheet_name]
+            found_header_row, found_device_col, found_czynsz_col, found_prad_col = _find_rent_columns(candidate_ws)
+            if found_header_row:
+                ws = candidate_ws
+                header_sheet_name = candidate_sheet_name
+                header_row = found_header_row
+                device_col = found_device_col
+                czynsz_col = found_czynsz_col
+                prad_col = found_prad_col
                 break
 
         if header_row is None:
@@ -2789,8 +2984,18 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
             )
             return {}
 
+        if header_sheet_name and header_sheet_name != sheet_name:
+            print(
+                "WARN Znaleziono kolumny najmu w innym arkuszu: "
+                f"{header_sheet_name} (pierwotnie wybrano {sheet_name})"
+            )
+
         if device_col is None or czynsz_col is None or prad_col is None:
             print("⚠ Niekompletna konfiguracja kolumn najmu")
+            return {}
+
+        if ws is None:
+            print("⚠ Nie udało się zainicjalizować arkusza najmu")
             return {}
 
         min_col = min(device_col, czynsz_col, prad_col)
@@ -2816,7 +3021,7 @@ def _load_rent_costs_by_device(month_str, rent_file=DEFAULT_RENT_FILE, rent_shee
 
             if raw_device is None and raw_czynsz is None and raw_prad is None:
                 empty_streak += 1
-                if empty_streak >= 200:
+                if empty_streak >= 500:
                     break
                 continue
 
@@ -2889,13 +3094,9 @@ def _load_elavon_total_from_costs_file(month_str, elavon_costs_file):
                 if not _matches_month_cell(ws.cell(r, 2).value):
                     continue
 
-                row_total = 0.0
-                for c in range(3, ws.max_column + 1):
-                    value = ws.cell(r, c).value
-                    if isinstance(value, (int, float)):
-                        row_total += float(value)
-                if row_total > 0:
-                    elavon_amount = row_total
+                elavon_value = ws.cell(r, 3).value
+                elavon_amount = _as_float(elavon_value)
+                if elavon_amount > 0:
                     break
 
             if elavon_amount > 0:
@@ -3011,15 +3212,12 @@ def _load_service_overrides_from_xlsx(service_file=None, sheet_index=DEFAULT_SER
         return location_by_device, service_cost_by_device
     finally:
         wb.close()
-
-
 def _load_lista_automatow_locations_from_xlsx(lista_file=None, month_str=None):
     """
     Wczytuje lokalizacje z pliku lista automatów.xlsx dla roku 2025.
     Oczekiwane kolumny: Nr TVM, Nazwa stacji.
     """
     location_by_device = {}
-
     if month_str:
         try:
             year, _month = map(int, month_str.split('-'))
@@ -3029,22 +3227,18 @@ def _load_lista_automatow_locations_from_xlsx(lista_file=None, month_str=None):
                 lista_file = DEFAULT_LISTA_AUTOMATOW_FILE
         except (ValueError, IndexError):
             pass
-
     if lista_file is None:
         return location_by_device
-
     lista_path = Path(lista_file)
     if not lista_path.exists():
         print(f"⚠ Brak pliku lista automatów: {lista_path}")
         return location_by_device
-
     try:
         from openpyxl import load_workbook
         wb = load_workbook(lista_path, data_only=True, read_only=True)
     except Exception as e:
         print(f"⚠ Nie udało się odczytać pliku lista automatów: {e}")
         return location_by_device
-
     try:
         for ws in wb.worksheets:
             header_row = None
@@ -3111,15 +3305,12 @@ def _get_monthly_costs_per_device(
     normalized_ids = sorted({int(device_id) for device_id in device_ids})
     if not normalized_ids:
         return {}
-
     default_entry = {
         **{key: 0.0 for key in TVM_COST_KEYS},
         **{key: 0.0 for key in OTHER_COST_KEYS},
     }
-
     if costs_file is None:
         return {device_id: dict(default_entry) for device_id in normalized_ids}
-
     costs_path = Path(costs_file)
     if not costs_path.exists():
         fallback_costs_path = Path(__file__).parent / 'Koszty' / costs_path.name
@@ -3424,6 +3615,203 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     _format_worksheet_columns(ws)
 
 
+def _build_summary_rows_for_month(
+    month_str,
+    payload,
+    device_ids,
+    costs_file=DEFAULT_COSTS_FILE,
+    rent_file=DEFAULT_RENT_FILE,
+    rent_sheet=None,
+    amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
+    amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
+):
+    """
+    Buduje wiersze zestawienia dla jednego miesiaca bez tworzenia arkuszy P&L.
+    """
+    revenue_data = payload.get('revenue_data') or {}
+    commission_rules = payload.get('commission_rules') or {}
+    service_cost_by_device = payload.get('service_cost_by_device') or {}
+    it_card_switch_dates = payload.get('it_card_switch_dates') or {}
+
+    all_device_ids = sorted(set(
+        [int(device_id) for device_id in revenue_data.keys()]
+        + [int(device_id) for device_id in (device_ids or [])]
+    ))
+
+    if device_ids:
+        allowed_ids = {int(device_id) for device_id in device_ids}
+        all_device_ids = [device_id for device_id in all_device_ids if device_id in allowed_ids]
+
+    costs_by_device = _get_monthly_costs_per_device(
+        month_str,
+        all_device_ids,
+        costs_file=costs_file,
+        rent_file=rent_file,
+        rent_sheet=rent_sheet,
+        service_cost_by_device=service_cost_by_device,
+        it_card_switch_dates=it_card_switch_dates,
+        commission_rules=commission_rules,
+    )
+
+    month_start, month_end = _month_date_bounds(month_str)
+    rows = []
+
+    for device_id in all_device_ids:
+        rev_entry = revenue_data.get(device_id) or {}
+        rev_by_carrier = {}
+        if isinstance(rev_entry, dict):
+            if isinstance(rev_entry.get('by_carrier'), dict):
+                rev_by_carrier = rev_entry['by_carrier']
+            elif rev_entry:
+                rev_by_carrier = {next(iter(rev_entry.keys()), ''): rev_entry}
+
+        row_commission_total = 0.0
+        row_interchange_total = 0.0
+        cashless_total = 0.0
+
+        for carrier_code, rev in rev_by_carrier.items():
+            if not carrier_code:
+                continue
+            amount = 0.0
+            by_payment_method = {key: 0.0 for key in PAYMENT_METHOD_KEYS}
+            if isinstance(rev, dict):
+                amount = float(rev.get('obrot_brutto_zl', 0.0) or 0.0)
+                method_values = rev.get('by_payment_method')
+                if isinstance(method_values, dict):
+                    for method_key in PAYMENT_METHOD_KEYS:
+                        by_payment_method[method_key] = float(method_values.get(method_key, 0.0) or 0.0)
+
+            netto_amount = amount / 1.08
+            rules_for_key = commission_rules.get((int(device_id), _normalize_carrier_code(carrier_code)), [])
+            picked_rules = _pick_commission_rules_for_month(rules_for_key, month_start, month_end)
+            row_commission_total += _commission_amount_from_rules(picked_rules, netto_amount)
+
+            cashless_for_carrier = by_payment_method['karta'] + by_payment_method['blik']
+            cashless_total += cashless_for_carrier
+            row_interchange_total += cashless_for_carrier * INTERCHANGE_RATE_BY_CARRIER.get(_normalize_carrier_code(carrier_code), 0.0)
+
+        cost_entry = dict(costs_by_device.get(device_id, {}))
+        it_card_ratio = _it_card_active_ratio_for_month(it_card_switch_dates.get(device_id), month_str)
+        cost_entry['it_card'] = cashless_total * 0.0134 * it_card_ratio
+
+        tvm_cost_sum = sum(float(cost_entry.get(key, 0.0) or 0.0) for key in TVM_COST_KEYS)
+        other_total = sum(float(cost_entry.get(key, 0.0) or 0.0) for key in OTHER_COST_KEYS)
+        all_costs_total = tvm_cost_sum + other_total
+        additional_profit_value = _get_additional_profit_value(month_str, device_id)
+
+        rows.append({
+            'miesiac': month_str,
+            'device_id': device_id,
+            'koszty': float(all_costs_total),
+            'przychody': float(row_commission_total + row_interchange_total),
+            'profit_loss': float(row_commission_total + row_interchange_total + additional_profit_value - all_costs_total),
+        })
+
+    return rows
+
+
+def _create_summary_only_sheet(wb, rows):
+    """
+    Tworzy jedyny arkusz w nowym skoroszycie z zestawieniem.
+    """
+    ws = wb.active
+    ws.title = 'Zestawienie'
+
+    title_fill = PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid')
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    summary_fill = PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid')
+    header_font = Font(bold=True, color='FFFFFF')
+    title_font = Font(bold=True, size=14)
+    thin_side = Side(style='thin', color='000000')
+    thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    ws.merge_cells('A1:E1')
+    ws['A1'] = 'Zestawienie 1129-1134'
+    ws['A1'].fill = title_fill
+    ws['A1'].font = title_font
+    ws['A1'].alignment = Alignment(horizontal='center', vertical='center')
+    ws['A1'].border = thin_border
+
+    headers = ['Miesiac', 'Nr automatu', 'Koszty', 'Przychody', 'Profit/loss']
+    header_row = 2
+    for col_num, header in enumerate(headers, 1):
+        cell = ws.cell(row=header_row, column=col_num, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = thin_border
+
+    data_start_row = 3
+    for index, row in enumerate(rows, start=data_start_row):
+        ws.cell(row=index, column=1, value=row['miesiac'])
+        ws.cell(row=index, column=2, value=row['device_id'])
+        ws.cell(row=index, column=3, value=row['koszty']).number_format = '#,##0.00'
+        ws.cell(row=index, column=4, value=row['przychody']).number_format = '#,##0.00'
+        ws.cell(row=index, column=5, value=row['profit_loss']).number_format = '#,##0.00'
+        for col_num in range(1, 6):
+            cell = ws.cell(row=index, column=col_num)
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal='center' if col_num != 1 else 'left', vertical='center')
+
+    total_row = data_start_row + len(rows)
+    ws.cell(row=total_row, column=1, value='SUMA')
+    for col_num in (3, 4, 5):
+        col_letter = get_column_letter(col_num)
+        summary_cell = ws.cell(row=total_row, column=col_num, value=f"=SUM({col_letter}{data_start_row}:{col_letter}{total_row - 1})")
+        summary_cell.number_format = '#,##0.00'
+
+    for col_num in range(1, 6):
+        cell = ws.cell(row=total_row, column=col_num)
+        cell.fill = summary_fill
+        cell.font = Font(bold=True)
+        cell.border = thin_border
+
+    ws.freeze_panes = 'A3'
+    ws.column_dimensions['A'].width = 12
+    ws.column_dimensions['B'].width = 12
+    ws.column_dimensions['C'].width = 14
+    ws.column_dimensions['D'].width = 14
+    ws.column_dimensions['E'].width = 14
+
+
+def export_summary_only(
+    month_payloads,
+    filename,
+    device_ids=None,
+    costs_file=DEFAULT_COSTS_FILE,
+    rent_file=DEFAULT_RENT_FILE,
+    rent_sheet=None,
+    amortyzacja_file=DEFAULT_AMORTYZACJA_FILE,
+    amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
+):
+    """
+    Eksportuje osobny skoroszyt zawierajacy tylko arkusz zestawienia.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = OUTPUT_DIR / filename
+    wb = Workbook()
+
+    summary_rows = []
+    for month_str, payload in month_payloads:
+        summary_rows.extend(
+            _build_summary_rows_for_month(
+                month_str,
+                payload,
+                device_ids=device_ids,
+                costs_file=costs_file,
+                rent_file=rent_file,
+                rent_sheet=rent_sheet,
+                amortyzacja_file=amortyzacja_file,
+                amortyzacja_sheet=amortyzacja_sheet,
+            )
+        )
+
+    _create_summary_only_sheet(wb, summary_rows)
+    wb.save(filepath)
+    print(f"\n✓ Zestawienie zapisane: {filepath}")
+    return filepath
+
+
 def get_monthly_revenue(
     conn,
     month_str,
@@ -3567,6 +3955,158 @@ def _resolve_transactions_payment_method_col_for_carrier(carrier_code, default_p
     """
     normalized = _normalize_carrier_code(carrier_code)
     return TRANSACTIONS_PAYMENT_METHOD_COL_OVERRIDES.get(normalized, default_payment_method_col)
+
+
+def _resolve_transactions_ticket_col_for_carrier(carrier_code, default_ticket_col):
+    """
+    Zwraca kolumnę liczby biletów dla przewoźnika.
+    """
+    normalized = _normalize_carrier_code(carrier_code)
+    return TRANSACTIONS_TICKET_COL_OVERRIDES.get(normalized, default_ticket_col)
+
+
+def _resolve_ticket_transactions_source(conn, schema_name, table_name, date_col, device_col, ticket_col):
+    """
+    Rozpoznaje źródło danych biletowych (data, automat, fin_l_bil).
+    """
+    columns = _get_table_columns(conn, schema_name, table_name)
+    if not columns:
+        return None
+
+    lowered = {c.lower(): c for c in columns}
+    resolved_date_col = lowered.get(str(date_col).lower())
+    resolved_ticket_col = lowered.get(str(ticket_col).lower())
+
+    resolved_device_col = None
+    if isinstance(device_col, (list, tuple)):
+        for candidate in device_col:
+            found = lowered.get(str(candidate).lower())
+            if found:
+                resolved_device_col = found
+                break
+    else:
+        resolved_device_col = lowered.get(str(device_col).lower())
+
+    if resolved_date_col is None or resolved_device_col is None or resolved_ticket_col is None:
+        return None
+
+    return {
+        'schema': schema_name,
+        'table': table_name,
+        'date_col': resolved_date_col,
+        'device_col': resolved_device_col,
+        'ticket_col': resolved_ticket_col,
+    }
+
+
+def get_monthly_ticket_counts_by_carrier(
+    conn,
+    month_str,
+    carriers=None,
+    table_name=TRANSACTIONS_SOURCE_CONFIG['table'],
+    date_col=TRANSACTIONS_SOURCE_CONFIG['date_col'],
+    device_col=TRANSACTIONS_SOURCE_CONFIG['device_col'],
+    ticket_col=TRANSACTIONS_TICKET_COL,
+    use_device_range_filter=True,
+):
+    """
+    Pobiera liczbę biletów (fin_l_bil) per automat i per przewoźnik.
+    Zwraca: {device_id: {carrier_code: ticket_count}}
+    """
+    start_date, end_date = get_month_range_closed(month_str)
+    carriers = carriers or CARRIERS
+    ticket_counts_by_device = {}
+
+    for carrier in carriers:
+        carrier_code = _normalize_carrier_code(carrier)
+        primary_table_name = _resolve_transactions_table_for_carrier(carrier_code, table_name)
+        carrier_device_col = _resolve_transactions_device_col_for_carrier(carrier_code, device_col)
+        carrier_ticket_col = _resolve_transactions_ticket_col_for_carrier(carrier_code, ticket_col)
+
+        candidate_tables = [primary_table_name]
+        if str(primary_table_name).lower() != str(table_name).lower():
+            candidate_tables.append(str(table_name))
+
+        source = None
+        for candidate_table in candidate_tables:
+            source = _resolve_ticket_transactions_source(
+                conn,
+                schema_name=carrier_code,
+                table_name=candidate_table,
+                date_col=date_col,
+                device_col=carrier_device_col,
+                ticket_col=carrier_ticket_col,
+            )
+            if source is not None:
+                break
+
+        if source is None:
+            print(
+                f"⚠ Bilety {carrier_code}: brak źródła {carrier_code}.{primary_table_name} "
+                f"(kolumny: {carrier_device_col}, {date_col}, {carrier_ticket_col}); ustawiam 0"
+            )
+            continue
+
+        params = [start_date, end_date]
+        device_filter_sql = sql.SQL('')
+        if use_device_range_filter:
+            device_expr = sql.SQL("{device_col}::bigint").format(
+                device_col=sql.Identifier(source['device_col'])
+            )
+            device_filter_sql = sql.SQL(" AND {device_filter}").format(
+                device_filter=_build_device_filter_sql(device_expr)
+            )
+        numeric_device_sql = sql.SQL(" AND {device_col}::text ~ '^[0-9]+$'").format(
+            device_col=sql.Identifier(source['device_col'])
+        )
+
+        query = sql.SQL(
+            """
+            SELECT
+                {device_col} AS device_id,
+                SUM(COALESCE({ticket_col}, 0)) AS liczba_biletow
+            FROM {schema}.{table}
+            WHERE {date_col} >= %s
+              AND {date_col} <= %s
+              {numeric_device_filter}
+              {device_filter}
+            GROUP BY {device_col}
+            ORDER BY device_id
+            """
+        ).format(
+            schema=sql.Identifier(source['schema']),
+            table=sql.Identifier(source['table']),
+            device_col=sql.Identifier(source['device_col']),
+            ticket_col=sql.Identifier(source['ticket_col']),
+            date_col=sql.Identifier(source['date_col']),
+            numeric_device_filter=numeric_device_sql,
+            device_filter=device_filter_sql,
+        )
+
+        cursor = conn.cursor()
+        try:
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
+            print(
+                f"✓ Bilety {carrier_code}: {source['schema']}.{source['table']} "
+                f"({source['device_col']}, {source['ticket_col']}, {source['date_col']}) -> {len(rows)} rekordów"
+            )
+        except psycopg2.Error as e:
+            print(f"⚠ Błąd pobierania liczby biletów dla {carrier_code}: {e}; ustawiam 0")
+            rows = []
+        finally:
+            cursor.close()
+
+        for raw_device_id, ticket_count in rows:
+            try:
+                device_id_int = int(raw_device_id)
+            except (TypeError, ValueError):
+                continue
+
+            ticket_counts_by_device.setdefault(device_id_int, {})
+            ticket_counts_by_device[device_id_int][carrier_code] = float(ticket_count or 0.0)
+
+    return ticket_counts_by_device
 
 
 def _preview_column_name(column_ref):
@@ -4022,7 +4562,7 @@ def export_to_excel_PL(
     num3_col = carrier_end_col + 1
     przychody_start_col = num3_col + 1
     przychody_cols = {
-        'prowizja_suma': przychody_start_col,
+        'prowizja': przychody_start_col,
         'interchange': przychody_start_col + 1,
         'dodatkowe_zyski': przychody_start_col + 2,
     }
@@ -4134,7 +4674,7 @@ def export_to_excel_PL(
     header_values = {
         info_nr_col: 'Nr TVM',
         info_loc_col: 'Lokalizacja automatu',
-        przychody_cols['prowizja_suma']: 'Prowizja Suma',
+        przychody_cols['prowizja']: 'Prowizja',
         przychody_cols['interchange']: 'Interchange',
         przychody_cols['dodatkowe_zyski']: 'Dodatkowe zyski',
         koszty_tvm_col: 'Koszty TVM',
@@ -4368,7 +4908,7 @@ def export_to_excel_PL(
             cols = carrier_columns[code]
             numeric_columns.extend([cols['brutto'], cols['prowizja'], cols['netto'], cols['gotowka'], cols['karta'], cols['blik']])
         numeric_columns.extend([
-            przychody_cols['prowizja_suma'],
+            przychody_cols['prowizja'],
             przychody_cols['interchange'],
             przychody_cols['dodatkowe_zyski'],
         ])
@@ -4478,7 +5018,7 @@ def export_to_excel_PL(
         ws.column_dimensions[get_column_letter(cols['karta'])].width = 11
         ws.column_dimensions[get_column_letter(cols['blik'])].width = 10
     ws.column_dimensions[get_column_letter(num3_col)].width = 4
-    for col in [przychody_cols['prowizja_suma'], przychody_cols['interchange'], przychody_cols['dodatkowe_zyski']]:
+    for col in [przychody_cols['prowizja'], przychody_cols['interchange'], przychody_cols['dodatkowe_zyski']]:
         ws.column_dimensions[get_column_letter(col)].width = 14
     ws.column_dimensions[get_column_letter(num4_col)].width = 4
     for col in list(tvm_cost_cols.values()) + [koszty_tvm_col] + list(other_cost_cols.values()) + [dodatkowe_koszty_col]:
@@ -4876,6 +5416,36 @@ def main():
         help='Tryb nazewnictwa pliku wyjściowego'
     )
     parser.add_argument(
+        '--summary-only',
+        action='store_true',
+        help='Tworzy osobny plik Excel zawierajacy tylko arkusz zestawienia'
+    )
+    parser.add_argument(
+        '--summary-start-month',
+        type=str,
+        default='2025-01',
+        help='Poczatek zakresu dla zestawienia (YYYY-MM)'
+    )
+    parser.add_argument(
+        '--summary-end-month',
+        type=str,
+        default='2026-02',
+        help='Koniec zakresu dla zestawienia (YYYY-MM)'
+    )
+    parser.add_argument(
+        '--summary-devices',
+        nargs='*',
+        type=int,
+        default=[1129, 1130, 1131, 1132, 1133, 1134],
+        help='Lista automatow do zestawienia (domyslnie: 1129 1130 1131 1132 1133 1134)'
+    )
+    parser.add_argument(
+        '--summary-output',
+        type=str,
+        default=None,
+        help='Nazwa pliku wyjsciowego dla osobnego zestawienia'
+    )
+    parser.add_argument(
         '--month-payload-source',
         choices=['auto', 'fresh', 'cache-only', 'no-cache'],
         default='auto',
@@ -4948,6 +5518,100 @@ def main():
     except psycopg2.Error as e:
         print(f"❌ Błąd połączenia z bazą: {e}")
         raise SystemExit(1)
+
+    if args.summary_only:
+        if not _validate_month_format(args.summary_start_month):
+            print(f"❌ Nieprawidlowy format summary-start-month: {args.summary_start_month}. Uzyj YYYY-MM")
+            conn.close()
+            return
+        if not _validate_month_format(args.summary_end_month):
+            print(f"❌ Nieprawidlowy format summary-end-month: {args.summary_end_month}. Uzyj YYYY-MM")
+            conn.close()
+            return
+        if args.summary_start_month > args.summary_end_month:
+            print("❌ summary-start-month nie moze byc pozniejszy niz summary-end-month")
+            conn.close()
+            return
+
+        summary_device_ids = [int(device_id) for device_id in (args.summary_devices or [])]
+        if not summary_device_ids:
+            summary_device_ids = [1129, 1130, 1131, 1132, 1133, 1134]
+        report_months = _build_month_range(args.summary_start_month, args.summary_end_month)
+
+        source_workbook = _find_latest_pl_workbook()
+        if source_workbook is not None:
+            summary_rows = _extract_summary_rows_from_pl_workbook(
+                source_workbook,
+                summary_device_ids,
+                args.summary_start_month,
+                args.summary_end_month,
+            )
+            if summary_rows:
+                summary_output = args.summary_output or build_summary_output_filename(
+                    args.summary_start_month,
+                    args.summary_end_month,
+                    summary_device_ids,
+                )
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                wb = Workbook()
+                _create_summary_only_sheet(wb, summary_rows)
+                wb.save(OUTPUT_DIR / summary_output)
+                print(f"✓ Zestawienie zapisane: {OUTPUT_DIR / summary_output}")
+                conn.close()
+                return
+
+        month_payloads = []
+        cache_misses = []
+        for report_month in report_months:
+            month_snapshot = load_snapshot(report_month)
+            if month_snapshot is None:
+                cache_misses.append(report_month)
+                continue
+
+            payload = load_month_payload_cache(report_month, args, month_snapshot)
+            if payload is None:
+                cache_misses.append(report_month)
+                continue
+
+            month_payloads.append((report_month, payload))
+
+        if cache_misses:
+            print(f"⚠ Brak cache lub snapshot dla miesiecy: {', '.join(cache_misses)}")
+            print("⚠ Próba pobrania brakujących miesięcy z bazy...")
+            for report_month in cache_misses:
+                month_snapshot = load_snapshot(report_month)
+                if month_snapshot is None:
+                    print(f"❌ Brak snapshotu dla {report_month}; pomijam ten miesiąc")
+                    continue
+                payload = _build_month_export_payload(
+                    conn,
+                    report_month,
+                    args,
+                    month_snapshot,
+                    revenue_data_override=None,
+                )
+                save_month_payload_cache(report_month, args, month_snapshot, payload)
+                month_payloads.append((report_month, payload))
+
+        month_payloads = sorted(month_payloads, key=lambda item: item[0])
+
+        summary_output = args.summary_output or build_summary_output_filename(
+            args.summary_start_month,
+            args.summary_end_month,
+            summary_device_ids,
+        )
+        export_summary_only(
+            month_payloads,
+            summary_output,
+            device_ids=summary_device_ids,
+            costs_file=args.koszty_file,
+            rent_file=args.najem_file,
+            rent_sheet=args.najem_sheet,
+            amortyzacja_file=args.amortyzacja_file,
+            amortyzacja_sheet=args.amortyzacja_sheet,
+        )
+        conn.close()
+        return
 
     if args.validate_provision_only:
         if not args.reference_provision_xls:
@@ -5116,19 +5780,7 @@ def main():
                 save_month_payload_cache(report_month, args, dictionary_comparison, payload)
 
         month_payloads.append((report_month, payload))
-
     filename = build_output_filename(month_str, naming_mode=args.output_naming)
-    if month_str == '2026-03' and str(filename).lower().startswith('raport_tymczasowy'):
-        filename = build_output_filename(month_str, naming_mode='default')
-
-    if month_str == '2026-03':
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        for legacy_temp in OUTPUT_DIR.glob('Raport_tymczasowy*2026-03*.xlsx'):
-            try:
-                legacy_temp.unlink()
-            except OSError:
-                pass
-
     export_multi_month_PL(
         dictionary_comparison,
         month_payloads,
