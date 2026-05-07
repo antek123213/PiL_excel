@@ -52,7 +52,6 @@ DEFAULT_AMORTYZACJA_2025_FILE = Path(__file__).parent / 'Koszty' / 'amortyzacja_
 DEFAULT_AMORTYZACJA_2026_FILE = Path(__file__).parent / 'Koszty' / 'amortyzacja_26.xlsx'
 DEFAULT_AMORTYZACJA_FILE = DEFAULT_AMORTYZACJA_2026_FILE
 DEFAULT_PROWIZJE_FILE = Path(__file__).parent / 'Prowizje_AB.xlsx'
-DEFAULT_LISTA_AUTOMATOW_FILE = Path(__file__).parent / 'lista automatów.xlsx'
 DEFAULT_RELOKACJE_FILE = Path(__file__).parent / 'Relokacje AB.txt'
 DEFAULT_SERWIS_FILE = Path(__file__).parent / 'Koszty' / 'serwis_2026.xlsx'
 DEFAULT_IT_CARD_SWITCH_FILE = Path(__file__).parent / 'Koszty' / 'IT CARD.xlsx'
@@ -3721,7 +3720,7 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
 
     header_row = 2
     for col_num, header in enumerate(headers, 1):
-        cell = ws.cell(row=header_row, column=col_num)
+        cell = ws.cell(row=1, column=col_num)
         cell.value = header
         cell.font = Font(bold=True, color='FFFFFF')
         
@@ -4637,7 +4636,7 @@ def export_to_excel_PL(
         cell.border = thin_border
     
     # === DANE ===
-    row_num = data_start_row
+    row_num = 2
     location_by_device = location_by_device or {}
     automat_type_by_device = automat_type_by_device or {}
     relocation_active_device_ids = {int(device_id) for device_id in (relocation_active_device_ids or set())}
@@ -4775,22 +4774,26 @@ def export_to_excel_PL(
         it_card_value = cashless_total * 0.0134 * it_card_ratio
         cost_entry['it_card'] = it_card_value
 
+        costs_col = total_col + 5
         tvm_cost_sum = 0.0
         for key in TVM_COST_KEYS:
             val = float(cost_entry.get(key, 0.0) or 0.0)
             tvm_cost_sum += val
-            ws.cell(row=row_num, column=tvm_cost_cols[key], value=val)
-            ws.cell(row=row_num, column=tvm_cost_cols[key]).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=costs_col).value = val
+            ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
+            costs_col += 1
 
-        ws.cell(row=row_num, column=koszty_tvm_col, value=tvm_cost_sum)
-        ws.cell(row=row_num, column=koszty_tvm_col).number_format = '#,##0.00'
+        ws.cell(row=row_num, column=costs_col).value = tvm_cost_sum
+        ws.cell(row=row_num, column=costs_col).number_format = '#,##0.00'
+        costs_col += 1
 
+        other_costs_offset = len(OTHER_COST_KEYS)
         other_total = 0.0
-        for key in OTHER_COST_KEYS:
+        for offset, key in enumerate(OTHER_COST_KEYS):
             val = float(cost_entry.get(key, 0.0) or 0.0)
             other_total += val
-            ws.cell(row=row_num, column=other_cost_cols[key], value=val)
-            ws.cell(row=row_num, column=other_cost_cols[key]).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=costs_col + offset).value = val
+            ws.cell(row=row_num, column=costs_col + offset).number_format = '#,##0.00'
 
         all_costs_total = tvm_cost_sum + other_total
         ws.cell(row=row_num, column=dodatkowe_koszty_col, value=other_total)
@@ -4866,7 +4869,10 @@ def export_to_excel_PL(
                 column=col_num,
                 value=f"=SUM({col_letter}{data_start_row}:{col_letter}{last_data_row})",
             )
+<<<<<<< HEAD
             if col_num in ticket_columns.values() or col_num == podsum_cols['bilety_suma']:
+=======
+ 
                 summary_cell.number_format = '#,##0'
             else:
                 summary_cell.number_format = '#,##0.00'
@@ -4879,8 +4885,8 @@ def export_to_excel_PL(
         row_num += 1
 
     if last_data_row >= 2:
-        result_col_letter = get_column_letter(result_col_idx)
-        result_range = f"{result_col_letter}{data_start_row}:{result_col_letter}{last_data_row}"
+        result_col_letter = ws.cell(row=1, column=result_col_idx).column_letter
+        result_range = f"{result_col_letter}2:{result_col_letter}{last_data_row}"
         ws.conditional_formatting.add(
             result_range,
             CellIsRule(
@@ -4941,6 +4947,7 @@ def export_to_excel_PL(
     for r in range(data_start_row, last_data_row + 1):
         ws.row_dimensions[r].height = 19
 
+<<<<<<< HEAD
     # Dynamic column sizing (+ 10% margin)
     for col_num in range(1, uwagi_col_idx + 1):
         max_len = 0
@@ -4954,6 +4961,34 @@ def export_to_excel_PL(
             # Special case to give a bit more for small columns and limit max width
             new_width = max_len * 1.1
             ws.column_dimensions[get_column_letter(col_num)].width = max(new_width, 4)
+=======
+    ws.column_dimensions[get_column_letter(num1_col)].width = 4
+    ws.column_dimensions[get_column_letter(info_nr_col)].width = 10
+    ws.column_dimensions[get_column_letter(info_loc_col)].width = 42
+    ws.column_dimensions[get_column_letter(num2_col)].width = 4
+    for code in carrier_order:
+        cols = carrier_columns[code]
+        ws.column_dimensions[get_column_letter(cols['brutto'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['prowizja'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['netto'])].width = 12
+        ws.column_dimensions[get_column_letter(cols['gotowka'])].width = 11
+        ws.column_dimensions[get_column_letter(cols['karta'])].width = 11
+        ws.column_dimensions[get_column_letter(cols['blik'])].width = 10
+    ws.column_dimensions[get_column_letter(num3_col)].width = 4
+    for col in ticket_columns.values():
+        ws.column_dimensions[get_column_letter(col)].width = 10
+    ws.column_dimensions[get_column_letter(num4_col)].width = 4
+    for col in [przychody_cols['prowizja_suma'], przychody_cols['interchange'], przychody_cols['dodatkowe_zyski']]:
+        ws.column_dimensions[get_column_letter(col)].width = 14
+    ws.column_dimensions[get_column_letter(num5_col)].width = 4
+    for col in list(tvm_cost_cols.values()) + [koszty_tvm_col] + list(other_cost_cols.values()) + [dodatkowe_koszty_col]:
+        ws.column_dimensions[get_column_letter(col)].width = 12
+    ws.column_dimensions[get_column_letter(num6_col)].width = 4
+    for col in podsum_cols.values():
+        ws.column_dimensions[get_column_letter(col)].width = 13
+    ws.column_dimensions[get_column_letter(num7_col)].width = 4
+    ws.column_dimensions[get_column_letter(uwagi_col_idx)].width = 22
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
 
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 100
@@ -5225,9 +5260,13 @@ def export_multi_month_PL(
     wb = Workbook()
 
     month_to_profit_loss = {}
+<<<<<<< HEAD
     month_to_tickets = {}
     month_to_commission_sum = {}
     
+=======
+    month_to_commission_sum = {}
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
     for month_str, payload in month_payloads:
         commission_data = build_monthly_commission_data_from_rules(
             payload.get('revenue_data') or {},
@@ -5239,8 +5278,11 @@ def export_multi_month_PL(
             for entry in commission_data.values()
         )
 
+<<<<<<< HEAD
         warehouse_ids = payload.get('warehouse_device_ids') or set()
 
+=======
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
         sheet_result = export_to_excel_PL(
             dictionary_comparison,
             payload['revenue_data'],
@@ -5261,15 +5303,23 @@ def export_multi_month_PL(
             service_cost_by_device=payload.get('service_cost_by_device') or {},
             it_card_switch_dates=payload.get('it_card_switch_dates') or {},
             relocation_active_device_ids=payload.get('relocation_active_device_ids') or set(),
+<<<<<<< HEAD
             warehouse_device_ids=warehouse_ids,
+=======
+            warehouse_device_ids=payload.get('warehouse_device_ids') or set(),
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
             included_device_ids=payload.get('included_device_ids') or [],
         )
         month_to_profit_loss[month_str] = sheet_result['profit_loss_by_device']
         month_to_tickets[month_str] = sheet_result['tickets_by_device']
 
     _create_profit_loss_summary_sheet(wb, month_to_profit_loss)
+<<<<<<< HEAD
     _create_tickets_summary_sheet(wb, month_to_tickets)
     _create_wyszukiwarka_sheet(wb)
+=======
+    _create_commission_cumulative_sheet(wb, month_to_commission_sum)
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
     wb.save(filepath)
     print(f"\n✓ Raport P&L eksportowany (wieloarkuszowy): {filepath}")
 
@@ -5382,10 +5432,20 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
             if device_id not in location_by_device and location:
                 location_by_device[device_id] = location
 
+<<<<<<< HEAD
     automat_type_by_device = _load_automat_type_map_from_lista(
         month_str,
         getattr(args, 'lista_automatow_file', DEFAULT_LISTA_AUTOMATOW_FILE),
         included_device_ids,
+=======
+    automat_type_by_device = get_automat_type_by_device_from_av(
+        conn,
+        included_device_ids,
+        schema_name='AV',
+        table_name='dictionary',
+        value_col='value',
+        groupid_col='groupid',
+>>>>>>> 4e5a60820643745ea3fef59fa1d7e3940c19cbb3
     )
 
     _, warehouse_device_ids = _load_amortyzacja_by_device_for_month(month_str)
