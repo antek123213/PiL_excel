@@ -1,0 +1,21 @@
+Option Explicit
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    On Error GoTo SafeExit
+
+    If Intersect(Target, Me.Range("C8,F8,G8,F10,G10")) Is Nothing Then
+        Exit Sub
+    End If
+
+    If Application.WorksheetFunction.CountA(Me.Range("C8,F8,G8,F10,G10")) < 5 Then
+        Exit Sub
+    End If
+
+    Application.EnableEvents = False
+    UruchomPorownanieTVM True
+
+SafeExit:
+    If Application.EnableEvents = False Then
+        Application.EnableEvents = True
+    End If
+End Sub

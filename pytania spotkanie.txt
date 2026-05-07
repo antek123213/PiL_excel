@@ -1,0 +1,3 @@
+//sprawdzenie automatów czy wliczac do kosztów które nie maja zadnej sprzedanych sa w projektcie rop i czy wliczac w nie koszty czy nie.jeśli tak to jest to pewna strata
+//czy jesli jest zerowa sprzedaz dla automatu,usunac czy co zrobic
+pokazac stary program

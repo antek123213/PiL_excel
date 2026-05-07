@@ -1,5 +1,0 @@
-1.odchylenia automatu(netto,ilosc), nieretownosc 
-2.profit/loss caly arkusz
-3.lokalizacje dac jako stacje pkp
-4. arkusz zestawieniowy jako 1. wybór nr_automatu 2. wybór miesiaca 3. miesiac porownawczy 4.wykresy interaktywne tak zeby dalo sie zoabczyc te autmaty 
-11.roczna tabela tylko dane głowne za miesiac
