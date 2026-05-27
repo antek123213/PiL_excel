@@ -1,0 +1,126 @@
+Option Explicit
+
+Private Sub Worksheet_SelectionChange(ByVal Target As Range)
+    If Not Intersect(Target, Range("B4")) Is Nothing Then
+        UpdateMachineDropdown
+    End If
+End Sub
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    On Error Resume Next
+    Application.EnableEvents = False
+    
+    If Not Intersect(Target, Range("B4")) Is Nothing Then
+        Range("B7:C8").ClearContents
+        UpdateYearDropdowns
+    End If
+    
+    If Not Intersect(Target, Range("B7,B8")) Is Nothing Then
+        UpdateMonthDropdown Target
+    End If
+    
+    If Not Intersect(Target, Range("B4,B7,C7,B8,C8")) Is Nothing Then
+        If Range("B4").Value <> "" And Range("C7").Value <> "" And Range("C8").Value <> "" Then
+            Call SearchAndCompare
+        End If
+    End If
+    
+    Application.EnableEvents = True
+End Sub
+
+' --- LISTY ROZWIJANE ZGODNE Z MACOS (UŻYCIE COLLECTION) ---
+
+Sub UpdateMachineDropdown()
+    Dim ws As Worksheet, col As New Collection, cell As Range
+    Dim lastRow As Long, item As Variant, listStr As String
+    
+    On Error Resume Next ' Ignoruje błędy przy dodawaniu duplikatów do kolekcji
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name Like "P&L *" Then
+            lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
+            If lastRow >= 3 Then
+                For Each cell In ws.Range("B3:B" & lastRow)
+                    If IsNumeric(cell.Value) And cell.Value <> "" Then
+                        ' Dodajemy element oraz klucz (klucz zapobiega duplikatom)
+                        col.Add CStr(cell.Value), CStr(cell.Value)
+                    End If
+                Next cell
+            End If
+        End If
+    Next ws
+    On Error GoTo 0
+    
+    If col.Count > 0 Then
+        For Each item In col: listStr = listStr & item & ",": Next item
+        SetDropdown Range("B4"), Left(listStr, Len(listStr) - 1)
+    End If
+End Sub
+
+Sub UpdateYearDropdowns()
+    Dim ws As Worksheet, tvm As Variant: tvm = Range("B4").Value
+    Dim col As New Collection, yearStr As String
+    Dim item As Variant, listStr As String
+    
+    If tvm = "" Then Exit Sub
+    
+    On Error Resume Next
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name Like "P&L *" Then
+            If FindTVMRow(ws, tvm) > 0 Then
+                yearStr = CStr(Split(Replace(ws.Name, "P&L ", ""), "-")(0))
+                col.Add yearStr, yearStr
+            End If
+        End If
+    Next ws
+    On Error GoTo 0
+    
+    If col.Count > 0 Then
+        For Each item In col: listStr = listStr & item & ",": Next item
+        SetDropdown Range("B7,B8"), Left(listStr, Len(listStr) - 1)
+    End If
+End Sub
+
+Sub UpdateMonthDropdown(ByVal Target As Range)
+    Dim ws As Worksheet, tvm As Variant: tvm = Range("B4").Value
+    Dim yearVal As String: yearVal = CStr(Target.Value)
+    Dim col As New Collection, monthPart As String, monthName As String
+    Dim item As Variant, listStr As String
+    
+    If tvm = "" Or yearVal = "" Then Exit Sub
+    
+    On Error Resume Next
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name Like "P&L " & yearVal & "-*" Then
+            If FindTVMRow(ws, tvm) > 0 Then
+                monthPart = CStr(Split(ws.Name, "-")(1))
+                monthName = MapNumberToMonth(monthPart)
+                If monthName <> "" Then col.Add monthName, monthName
+            End If
+        End If
+    Next ws
+    On Error GoTo 0
+    
+    If col.Count > 0 Then
+        For Each item In col: listStr = listStr & item & ",": Next item
+        SetDropdown Target.Offset(0, 1), Left(listStr, Len(listStr) - 1)
+    Else
+        MsgBox "Nie znaleziono danych dla automatu " & tvm & " w roku " & yearVal & "!", vbExclamation
+    End If
+End Sub
+
+Sub SetDropdown(rng As Range, vals As String)
+    On Error Resume Next
+    With rng.Validation
+        .Delete
+        .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Formula1:=vals
+        .IgnoreBlank = True: .InCellDropdown = True
+    End With
+    On Error GoTo 0
+End Sub
+
+Function MapNumberToMonth(ByVal num As String) As String
+    Dim months: months = Array("", "Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec", "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień")
+    If IsNumeric(num) Then
+        If CInt(num) >= 1 And CInt(num) <= 12 Then MapNumberToMonth = months(CInt(num))
+    End If
+End Function

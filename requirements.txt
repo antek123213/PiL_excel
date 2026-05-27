@@ -3,3 +3,4 @@
 openpyxl
 psycopg2-binary
 python-dateutil
+pywin32  # Required for VBA insertion into .xlsm files (Windows only)

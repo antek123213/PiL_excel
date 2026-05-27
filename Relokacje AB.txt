@@ -16,7 +16,7 @@
 1139 - Warszawa Centralna od 19.03.2026 
 1140 - Warszawa Centralna od 19.03.2026 
 1141 - Warszawa Zachodnia od 05.03.2026 
-1205 - Ciechocinek od 30.01.2026, do 30.05.2025 Wrocław
+1205 - Wrocław Główny do 30.05.2025,od 30.01.2026 Ciechocinek
 1215 - Aleksandrów Kujawski od 12.12.2025 
 1216 - Pszczyna do 18.06.2025 - 6/18/2025
 1224 - Kuźnica od 01.01.2025
@@ -38,3 +38,4 @@
 1274 - Czersk - od 09.04.2024 
 1275 - Rzeszów Główny do 10.09.2025 (był na dworcu tymczasowym) 
 1275 - Poznań Dębiec od 20.02.2026
+1137 - Politechnika Poznańska 29.05.2026

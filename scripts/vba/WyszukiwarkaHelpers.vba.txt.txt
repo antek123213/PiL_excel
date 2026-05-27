@@ -1,0 +1,123 @@
+Option Explicit
+
+' 1. Mapowanie miesięcy
+Function MapMonthToNumber(monthPL As String) As String
+    Dim m As String: m = LCase(Trim(monthPL))
+    Select Case m
+        Case "styczeń", "styczen": MapMonthToNumber = "01"
+        Case "luty": MapMonthToNumber = "02"
+        Case "marzec": MapMonthToNumber = "03"
+        Case "kwiecień", "kwiecien": MapMonthToNumber = "04"
+        Case "maj": MapMonthToNumber = "05"
+        Case "czerwiec": MapMonthToNumber = "06"
+        Case "lipiec": MapMonthToNumber = "07"
+        Case "sierpień", "sierpien": MapMonthToNumber = "08"
+        Case "wrzesień", "wrzesien": MapMonthToNumber = "09"
+        Case "październik", "pazdziernik": MapMonthToNumber = "10"
+        Case "listopad": MapMonthToNumber = "11"
+        Case "grudzień", "grudzien": MapMonthToNumber = "12"
+        Case Else: MapMonthToNumber = ""
+    End Select
+End Function
+
+' 2. Główna procedura wyszukiwania
+Sub SearchAndCompare()
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Sheets("Wyszukiwarka")
+    Dim tvmNumber As Variant, y1 As String, m1 As String, y2 As String, m2 As String
+    Dim sn1 As String, sn2 As String, sw1 As Worksheet, sw2 As Worksheet
+    Dim r1 As Long, r2 As Long
+    
+    On Error GoTo ErrorHandler
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    
+    ' POBIERANIE WEJŚĆ (B4, B7:C8)
+    tvmNumber = ws.Range("B4").Value 
+    y1 = Trim(CStr(ws.Range("B7").Value))
+    m1 = Trim(CStr(ws.Range("C7").Value))
+    y2 = Trim(CStr(ws.Range("B8").Value))
+    m2 = Trim(CStr(ws.Range("C8").Value))
+    
+    If tvmNumber = "" Or m1 = "" Or m2 = "" Then GoTo ExitSub
+
+    sn1 = "P&L " & y1 & "-" & MapMonthToNumber(m1)
+    sn2 = "P&L " & y2 & "-" & MapMonthToNumber(m2)
+    
+    On Error Resume Next
+    Set sw1 = ThisWorkbook.Sheets(sn1): Set sw2 = ThisWorkbook.Sheets(sn2)
+    On Error GoTo ErrorHandler
+    
+    If sw1 Is Nothing Or sw2 Is Nothing Then
+        MsgBox "Błąd: Brak arkusza danych dla wybranych dat.", vbCritical: GoTo ExitSub
+    End If
+    
+    ' SZUKANIE W DYNAMICZNYM ZAKRESIE
+    r1 = FindTVMRow(sw1, tvmNumber): r2 = FindTVMRow(sw2, tvmNumber)
+    
+    If r1 = 0 Or r2 = 0 Then
+        MsgBox "Automat " & tvmNumber & " nieobecny w wybranym okresie.", vbExclamation: GoTo ExitSub
+    End If
+    
+    ' AKTUALIZACJA TABELI WYNIKOWEJ (A13:E14)
+    With ws
+        .Range("A13").Value = m1 & " " & y1
+        .Range("B13").Value = sw1.Cells(r1, "H").Value
+        .Range("C13").Value = sw1.Cells(r1, "I").Value
+        .Range("D13").Value = sw1.Cells(r1, "G").Value
+        .Range("E13").Value = sw1.Cells(r1, "F").Value
+        
+        .Range("A14").Value = m2 & " " & y2
+        .Range("B14").Value = sw2.Cells(r2, "H").Value
+        .Range("C14").Value = sw2.Cells(r2, "I").Value
+        .Range("D14").Value = sw2.Cells(r2, "G").Value
+        .Range("E14").Value = sw2.Cells(r2, "F").Value
+    End With
+    
+    CreateOrUpdateChart ws, CStr(tvmNumber)
+    
+ExitSub:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+ErrorHandler:
+    MsgBox "Błąd: " & Err.Description: Resume ExitSub
+End Sub
+
+' 3. Szukanie TVM - NOWA, NIEZAWODNA WERSJA
+Function FindTVMRow(ws As Worksheet, tvmNum As Variant) As Long
+    Dim lastRow As Long
+    Dim i As Long
+    
+    lastRow = ws.Cells(ws.Rows.Count, "B").End(xlUp).Row
+    If lastRow < 3 Then lastRow = 3
+    
+    ' Szuka komórka po komórce, ignorując formatowanie jako tekst/liczba
+    For i = 3 To lastRow
+        If CStr(ws.Cells(i, "B").Value) = CStr(tvmNum) Then
+            FindTVMRow = i
+            Exit Function
+        End If
+    Next i
+    
+    FindTVMRow = 0
+End Function
+
+' 4. Procedura Wykresu
+Sub CreateOrUpdateChart(ws As Worksheet, tvmNumber As String)
+    On Error Resume Next
+    Dim chtObj As ChartObject
+    Set chtObj = ws.ChartObjects("WykresPorownania")
+    If chtObj Is Nothing Then
+        Set chtObj = ws.ChartObjects.Add(Left:=ws.Range("G3").Left, Top:=ws.Range("G3").Top, Width:=600, Height:=340)
+        chtObj.Name = "WykresPorownania"
+    End If
+    chtObj.RoundedCorners = True
+    With chtObj.Chart
+        .SetSourceData Source:=ws.Range("A12:E14"), PlotBy:=xlRows
+        .ChartType = xlColumnClustered
+        .HasTitle = True: .ChartTitle.Text = "Dane automatu " & tvmNumber
+        .FullSeriesCollection(1).Format.Fill.ForeColor.RGB = RGB(191, 191, 191)
+        .FullSeriesCollection(2).Format.Fill.ForeColor.RGB = RGB(91, 155, 213)
+        .Legend.Position = xlLegendPositionBottom
+    End With
+End Sub

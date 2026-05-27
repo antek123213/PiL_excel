@@ -42,7 +42,7 @@ DB_CONFIG = {
 }
 
 # Domyślny schemat źródłowy danych operacyjnych.
-SCHEMA = 'ARP'
+SCHEMA='ARP'
 SNAPSHOT_DIR = Path(__file__).parent / 'snapshots'
 MONTH_PAYLOAD_CACHE_DIR = SNAPSHOT_DIR / 'cache'
 OUTPUT_DIR = Path(__file__).parent / 'output'
@@ -200,13 +200,237 @@ def _end_of_month_date(month_str):
 def build_output_filename(month_str, naming_mode='default'):
     """
     Buduje nazwę pliku wyjściowego.
-    - default: PL_TVM_YYYY-MM.xlsx
-    - monitor-style: PROVISIONYYYYMMDDHHMMSS.xlsx
+    - default: PL_TVM_YYYY-MM.xlsm
+    - monitor-style: PROVISIONYYYYMMDDHHMMSS.xlsm
     """
     if naming_mode == 'monitor-style':
         ts = datetime.now().strftime('%Y%m%d%H%M%S')
-        return f"PROVISION{ts}.xlsx"
-    return f"PL_TVM_{month_str}.xlsx"
+        return f"PROVISION{ts}.xlsm"
+    return f"PL_TVM_{month_str}.xlsm"
+
+
+# === OBSŁUGA VBA I KONWERSJI NA .XLSM ===
+
+def _load_vba_code_from_file(vba_file_path):
+    """
+    Ładuje kod VBA z pliku .vba.txt
+    """
+    candidates = [Path(vba_file_path)]
+    # Some files in the repo may have an extra .txt suffix (e.g. .vba.txt.txt)
+    p = Path(vba_file_path)
+    if p.suffix == '.txt':
+        candidates.append(p.with_name(p.name + '.txt'))
+    # Also try removing a trailing .txt (in case user renamed differently)
+    if p.name.endswith('.txt.txt'):
+        candidates.append(p.with_name(p.name.replace('.txt.txt', '.txt')))
+
+    for candidate in candidates:
+        try:
+            with open(str(candidate), 'r', encoding='utf-8') as f:
+                print(f"✓ Załadowano VBA z: {candidate}")
+                return f.read()
+        except FileNotFoundError:
+            continue
+
+    print(f"⚠️ Plik VBA nie znaleziony: {vba_file_path}")
+    return ""
+
+
+def _get_vba_modules_dict():
+    """
+    Przygotowuje słownik modułów VBA do załadowania.
+    Ładuje kod z plików .vba.txt ze ścieżki scripts/vba/
+    """
+    vba_dir = Path(__file__).parent / 'scripts' / 'vba'
+    
+    vba_wyszukiwarka_file = vba_dir / 'Wyszukiwarka_Arkusz.vba.txt'
+    vba_helpers_file = vba_dir / 'WyszukiwarkaHelpers.vba.txt'
+    
+    vba_wyszukiwarka_code = _load_vba_code_from_file(vba_wyszukiwarka_file)
+    vba_helpers_code = _load_vba_code_from_file(vba_helpers_file)
+    
+    return {
+        'WyszukiwarkaCode': {
+            'code': vba_wyszukiwarka_code,
+            'type': 'WorksheetModule',
+            'target_sheet': 'Wyszukiwarka'
+        },
+        'WyszukiwarkaHelpers': {
+            'code': vba_helpers_code,
+            'type': 'StandardModule'
+        }
+    }
+
+
+def _convert_xlsx_to_xlsm_with_vba(xlsx_path, xlsm_path, vba_modules_dict):
+    """
+    Konwertuje .xlsx → .xlsm i wstawia kod VBA za pomocą COM (pywin32).
+    
+    vba_modules_dict: {
+        'module_name': {
+            'code': 'VBA code string',
+            'type': 'StandardModule' | 'WorksheetModule',
+            'target_sheet': 'Wyszukiwarka'  # dla WorksheetModule
+        }
+    }
+    """
+    try:
+        import win32com.client as win32
+    except ImportError:
+        print("⚠️ pywin32 nie zainstalowany. Pomijam VBA. Zainstaluj: pip install pywin32")
+        import shutil
+        shutil.copy(str(xlsx_path), str(xlsm_path))
+        os.remove(str(xlsx_path))
+        return
+    
+    excel = None
+    try:
+        excel = win32.Dispatch("Excel.Application")
+        try:
+            excel.Visible = False
+        except Exception as e:
+            print(f"⚠️ Nie udało się ustawić Visible=False: {e}")
+        try:
+            excel.DisplayAlerts = False
+        except Exception as e:
+            print(f"⚠️ Nie udało się ustawić DisplayAlerts=False: {e}")
+        
+        wb = excel.Workbooks.Open(str(xlsx_path))
+
+        try:
+            _ = wb.VBProject.VBComponents.Count
+        except Exception as e:
+            trust_hint = "Programistyczny dostęp do projektu w języku Visual Basic nie jest zaufany"
+            if trust_hint in str(e):
+                print(
+                    "⚠️ Excel blokuje dostęp do VBProject. Aby wstrzyknąć VBA, włącz w Excelu: "
+                    "Plik -> Opcje -> Centrum zaufania -> Ustawienia Centrum zaufania -> Ustawienia makr -> "
+                    "'Zaufaj dostępowi do modelu obiektowego projektu VBA'."
+                )
+                if os.path.exists(str(xlsm_path)):
+                    os.remove(str(xlsm_path))
+                wb.SaveAs(str(xlsm_path), FileFormat=52)
+                wb.Close()
+                print(f"✓ Zapisano plik .xlsm bez wstrzykniętego VBA: {xlsm_path}")
+                os.remove(str(xlsx_path))
+                return
+            raise
+        
+        for module_name, module_info in vba_modules_dict.items():
+            vba_code = module_info['code']
+            if not vba_code:
+                print(f"⚠️ Brak kodu dla modułu '{module_name}', pomijam")
+                continue
+            
+            module_type = module_info.get('type', 'StandardModule')
+            
+            if module_type == 'WorksheetModule':
+                sheet_name = module_info.get('target_sheet', 'Wyszukiwarka')
+                try:
+                    ws = wb.Sheets(sheet_name)
+                    ws.Activate()
+                    wb.VBProject.VBComponents(ws.CodeName).CodeModule.AddFromString(vba_code)
+                    print(f"✓ Dodano kod do arkusza '{sheet_name}'")
+                except Exception as e:
+                    if 'Programistyczny dostęp do projektu w języku Visual Basic nie jest zaufany' in str(e):
+                        print(
+                            "⚠️ Nie można dodać kodu do arkusza, bo Excel blokuje dostęp do VBProject. "
+                            "Plik zostanie zapisany bez VBA."
+                        )
+                        break
+                    print(f"⚠️ Nie udało się dodać do '{sheet_name}': {e}")
+            else:
+                try:
+                    vb_component = wb.VBProject.VBComponents.Add(1)
+                    vb_component.Name = module_name
+                    vb_component.CodeModule.AddFromString(vba_code)
+                    print(f"✓ Dodano moduł '{module_name}'")
+                except Exception as e:
+                    if 'Programistyczny dostęp do projektu w języku Visual Basic nie jest zaufany' in str(e):
+                        print(
+                            "⚠️ Nie można dodać modułu VBA, bo Excel blokuje dostęp do VBProject. "
+                            "Plik zostanie zapisany bez VBA."
+                        )
+                        break
+                    print(f"⚠️ Nie udało się dodać '{module_name}': {e}")
+        
+        # Ensure no workbook with the same name is open in this Excel instance
+        try:
+            target_name = Path(xlsm_path).name
+            for w in list(excel.Workbooks):
+                try:
+                    if w.Name == target_name and w.FullName != str(xlsx_path):
+                        w.Close(SaveChanges=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Remove existing file on disk if possible
+        if os.path.exists(str(xlsm_path)):
+            try:
+                os.remove(str(xlsm_path))
+            except PermissionError:
+                print(f"⚠️ Błąd: Zamknij plik {xlsm_path} przed ponownym generowaniem!")
+                wb.Close(SaveChanges=False)
+                return
+
+        # Try multiple save strategies to avoid COM SaveAs failures
+        saved = False
+        try:
+            wb.SaveAs(str(xlsm_path), FileFormat=52)
+            saved = True
+        except Exception as e_save:
+            print(f"⚠️ SaveAs nie powiodło się: {e_save}. Spróbuję SaveCopyAs...")
+            try:
+                wb.SaveCopyAs(str(xlsm_path))
+                saved = True
+            except Exception as e_copy:
+                print(f"⚠️ SaveCopyAs nie powiodło się: {e_copy}. Spróbuję ponownie z widocznym Excelem...")
+                try:
+                    excel.DisplayAlerts = True
+                    excel.Visible = True
+                    wb.SaveAs(str(xlsm_path), FileFormat=52)
+                    saved = True
+                except Exception as e2:
+                    print(f"❌ Wszystkie metody zapisu nie powiodły się: {e2}")
+                    import shutil
+                    try:
+                        shutil.copy(str(xlsx_path), str(xlsm_path))
+                        saved = True
+                        print("⚠️ Uwaga: zapisano kopię bez gwarancji wstrzyknięcia VBA (shutil.copy).")
+                    except Exception as e3:
+                        print(f"❌ Fallback (shutil.copy) też nie powiódł się: {e3}")
+
+        # Close workbook and cleanup
+        try:
+            wb.Close(SaveChanges=False)
+        except Exception:
+            try:
+                wb.Close()
+            except Exception:
+                pass
+
+        if saved:
+            print(f"✓ Plik .xlsm z VBA: {xlsm_path}")
+            try:
+                os.remove(str(xlsx_path))
+            except Exception:
+                pass
+        else:
+            raise Exception("Nie udało się zapisać pliku .xlsm; wszystkie metody zawiodły.")
+        
+    except Exception as e:
+        print(f"❌ Błąd konwersji: {e}")
+        raise
+    finally:
+        if excel:
+            try:
+                quit_method = getattr(excel, 'Quit', None)
+                if callable(quit_method):
+                    quit_method()
+            except Exception:
+                pass
 
 
 def _build_device_filter_sql(column_sql):
@@ -1893,6 +2117,63 @@ def _extract_monthly_value_from_header_table(ws, month_str, header_label, month_
     return total
 
 
+def _extract_yearly_value_in_section(ws, section_label, year, month_col=2, value_col=3):
+    """
+    Sumuje wartości z sekcji oznaczonej `section_label` dla podanego roku.
+    Szuka etykiety sekcji w kolumnie `month_col` i sumuje wiersze, których komórka daty
+    ma rok równy `year`.
+    """
+    section_row = _find_section_row(ws, section_label, label_col=month_col)
+    if section_row is None:
+        return 0.0
+
+    end_row = _get_section_end_row(ws, section_row, section_label_col=month_col)
+    total = 0.0
+    for r in range(section_row + 1, end_row + 1):
+        marker = ws.cell(r, month_col).value
+        if hasattr(marker, 'year') and hasattr(marker, 'month') and getattr(marker, 'year', None) == int(year):
+            total += _as_float(ws.cell(r, value_col).value)
+    return total
+
+
+def _resolve_annual_section_cost_for_month(wb, month_str, section_label, month_col=2, value_col=3):
+    """
+    Dla zadanego miesiąca `month_str` zwraca roczną sumę kosztu z sekcji `section_label`.
+    Najpierw próbuje zebrać sumę z roku bieżącego (na podstawie arkusza dla `month_str`).
+    Jeśli suma bieżącego roku == 0, próbuje znaleźć dane z poprzedniego roku (przeglądając arkusze
+    poprzedniego roku) i zwraca ich sumę.
+
+    Zwraca krotkę: (year_total: float, year: int|None, mode: 'current'|'previous'|'none')
+    """
+    try:
+        year = int(month_str.split('-')[0])
+        month = int(month_str.split('-')[1])
+    except Exception:
+        return 0.0, None, 'none'
+
+    # Bieżący rok: sprawdź arkusz dla month_str
+    sheet_name = _resolve_sheet_name_by_month(wb, month_str)
+    if sheet_name:
+        ws = wb[sheet_name]
+        current_total = _extract_yearly_value_in_section(ws, section_label, year, month_col=month_col, value_col=value_col)
+        if current_total and float(current_total) != 0.0:
+            return float(current_total), year, 'current'
+
+    # Fallback: poprzedni rok - przeszukaj arkusze poprzedniego roku
+    prev_year = year - 1
+    for m in range(1, 13):
+        candidate_month = f"{prev_year:04d}-{m:02d}"
+        cand_sheet = _resolve_sheet_name_by_month(wb, candidate_month)
+        if not cand_sheet:
+            continue
+        ws_prev = wb[cand_sheet]
+        prev_total = _extract_yearly_value_in_section(ws_prev, section_label, prev_year, month_col=month_col, value_col=value_col)
+        if prev_total and float(prev_total) != 0.0:
+            return float(prev_total), prev_year, 'previous'
+
+    return 0.0, None, 'none'
+
+
 def _normalize_header_text(value):
     """
     Normalizuje tekst nagłówka do porównań (usuwa spacje, kropki i znaki specjalne).
@@ -3539,10 +3820,20 @@ def _get_monthly_costs_per_device(
     global_costs['poczta_polska'] = _extract_monthly_value_in_section(ws, 'POCZTA POLSKA', month_str)
     # Amortyzacja jest odczytywana per automat z plików amortyzacja_25/amortyzacja_26.
     global_costs['amortyzacja'] = 0.0
-    global_costs['papier'] = _extract_monthly_value_in_section(ws, 'PAPIER', month_str)
+    papier_year_total, papier_year, papier_mode = _resolve_annual_section_cost_for_month(wb, month_str, 'PAPIER')
+    global_costs['papier'] = float(papier_year_total or 0.0) / 12.0
+    if papier_mode == 'previous':
+        print(f"INFO {month_str} PAPIER: użyto wartości rocznej z {papier_year} (fallback); miesięcznie {global_costs['papier']:.2f}")
+    else:
+        print(f"INFO {month_str} PAPIER: roczna suma {papier_year_total or 0.0:.2f} -> miesięcznie {global_costs['papier']:.2f}")
     global_costs['transmisja_danych'] = _extract_monthly_value_in_section(ws, 'TELEFONY/INTERNET', month_str)
     global_costs['utrzymanie_oprogramowania'] = _extract_monthly_value_in_section(ws, 'NORDPLUS', month_str)
-    global_costs['ubezpieczenie'] = _extract_monthly_value_in_section(ws, 'UBEZPIECZENIE AUTOMATÓW', month_str)
+    ubezpieczenie_year_total, ubezpieczenie_year, ubezpieczenie_mode = _resolve_annual_section_cost_for_month(wb, month_str, 'UBEZPIECZENIE AUTOMATÓW')
+    global_costs['ubezpieczenie'] = float(ubezpieczenie_year_total or 0.0) / 12.0
+    if ubezpieczenie_mode == 'previous':
+        print(f"INFO {month_str} UBEZPIECZENIE: użyto wartości rocznej z {ubezpieczenie_year} (fallback); miesięcznie {global_costs['ubezpieczenie']:.2f}")
+    else:
+        print(f"INFO {month_str} UBEZPIECZENIE: roczna suma {ubezpieczenie_year_total or 0.0:.2f} -> miesięcznie {global_costs['ubezpieczenie']:.2f}")
 
     # Serwis z pliku serwis_2026.xlsx; tu brak wartości globalnej.
     global_costs['serwis'] = 0.0
@@ -3636,8 +3927,7 @@ def _get_monthly_costs_per_device(
         tvm_sum = sum(float(per_device.get(key, 0.0) or 0.0) for key in TVM_COST_KEYS)
         per_device['oh'] = (
             float(per_device.get('non_tvm', 0.0) or 0.0) +
-            float(per_device.get('project_variable_costs', 0.0) or 0.0) +
-            tvm_sum
+            float(per_device.get('project_variable_costs', 0.0) or 0.0)
         ) * 0.2
         
         costs_by_device[device_id] = per_device
@@ -3685,40 +3975,50 @@ def _month_label_pl(month_str):
 
 def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     """
-    Tworzy 3. arkusz zbiorczy Profit/loss per automat i sumę roczną.
+    Tworzy 3. arkusz zbiorczy Profit/loss per automat z podziałem i sumowaniem rocznym.
     Wszystkie wartości pozostają liczbowe, także dla urządzeń magazynowych.
     """
     ws = wb.create_sheet(title='ProfitLoss_Summary')
     ordered_months = sorted(month_to_profit_loss.keys())
-    headers = ['Nr aut.'] + [f"Profit/loss {_month_label_pl(m)}" for m in ordered_months] + ['Zestawienie roczne (+/-)']
+    
+    # 1. Group months by year
+    years_to_months = {}
+    for m in ordered_months:
+        year = int(m.split('-')[0])
+        years_to_months.setdefault(year, []).append(m)
+        
+    year_to_cols = {}
+    headers = ['Nr aut.']
+    current_col = 2
+    
+    # 2. Build headers dynamically
+    for year in sorted(years_to_months.keys()):
+        start_col = current_col
+        for m in years_to_months[year]:
+            headers.append(f"Profit/loss {_month_label_pl(m)}")
+            current_col += 1
+        headers.append("Zestawienie roczne (+/-)")
+        end_col = current_col
+        year_to_cols[year] = (start_col, end_col)
+        current_col += 1
 
-    if ordered_months:
-        year_to_month_positions = {}
-        for month_idx, month_str in enumerate(ordered_months, start=2):
-            year = int(month_str.split('-')[0])
-            year_to_month_positions.setdefault(year, []).append(month_idx)
-
-        for year, columns in sorted(year_to_month_positions.items()):
-            start_col = min(columns)
-            end_col = max(columns)
-            if start_col == end_col:
-                year_cell = ws.cell(row=1, column=start_col)
-                year_cell.value = f"Rok {year}"
-                year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-                year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
-                year_cell.alignment = Alignment(horizontal='center', vertical='center')
-                continue
-
-            ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
-            year_cell = ws.cell(row=1, column=start_col)
-            year_cell.value = f"Rok {year}"
-            year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-            year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
-            year_cell.alignment = Alignment(horizontal='center', vertical='center')
-
+    # 3. Create the Year Group Header (Row 1)
     ws.cell(row=1, column=1).value = ''
     ws.cell(row=1, column=1).fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
 
+    for year, (start_col, end_col) in year_to_cols.items():
+        if start_col == end_col:
+            year_cell = ws.cell(row=1, column=start_col)
+        else:
+            ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+            year_cell = ws.cell(row=1, column=start_col)
+            
+        year_cell.value = f"Rok {year}"
+        year_cell.font = Font(bold=True, color='FFFFFF', size=12)
+        year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        year_cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # 4. Create the Column Header (Row 2)
     header_row = 2
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col_num)
@@ -3732,6 +4032,7 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
         
         cell.alignment = Alignment(horizontal='center', vertical='center')
 
+    # 5. Populate the Data
     all_device_ids = sorted({
         int(device_id)
         for month_map in month_to_profit_loss.values()
@@ -3741,21 +4042,41 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     row_num = 3
     for device_id in all_device_ids:
         ws.cell(row=row_num, column=1).value = device_id
-        monthly_sum = 0.0
+        
         col_idx = 2
-        for month_str in ordered_months:
-            value = float(month_to_profit_loss.get(month_str, {}).get(device_id, 0.0) or 0.0)
-            cell = ws.cell(row=row_num, column=col_idx)
-            cell.value = value
-            cell.number_format = '#,##0.00'
-            monthly_sum += value
-            col_idx += 1
+        for year in sorted(years_to_months.keys()):
+            first_month_col = get_column_letter(col_idx)
+            for m in years_to_months[year]:
+                value = float(month_to_profit_loss.get(m, {}).get(device_id, 0.0) or 0.0)
+                cell = ws.cell(row=row_num, column=col_idx)
+                cell.value = value
+                cell.number_format = '#,##0.00'
+                col_idx += 1
 
-        ws.cell(row=row_num, column=col_idx).value = float(monthly_sum)
-        ws.cell(row=row_num, column=col_idx).number_format = '#,##0.00'
+            last_month_col = get_column_letter(col_idx - 1)
+            # Add yearly sum formula
+            sum_cell = ws.cell(row=row_num, column=col_idx)
+            sum_cell.value = f"=SUM({first_month_col}{row_num}:{last_month_col}{row_num})"
+            sum_cell.number_format = '#,##0.00'
+            col_idx += 1
+            
         row_num += 1
 
     last_data_row = row_num - 1
+
+    # Podsumowanie dla każdego miesiąca (Suma)
+    sum_row = row_num
+    ws.cell(row=sum_row, column=1).value = "Suma"
+    ws.cell(row=sum_row, column=1).font = Font(bold=True)
+    for col in range(2, len(headers) + 1):
+        col_letter = get_column_letter(col)
+        cell = ws.cell(row=sum_row, column=col)
+        cell.value = f"=SUM({col_letter}3:{col_letter}{last_data_row})"
+        cell.number_format = '#,##0.00'
+        cell.font = Font(bold=True)
+    
+    row_num += 1
+
     if last_data_row >= 2:
         first_value_col_letter = get_column_letter(2)
         last_value_col_letter = get_column_letter(len(headers))
@@ -3792,6 +4113,64 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
     for row in range(2, row_num):
         for col in range(1, len(headers) + 1):
             ws.cell(row=row, column=col).border = thin_border
+
+    # Tabela sezonowości
+    curr_row = row_num + 2
+    for year in sorted(years_to_months.keys()):
+        months_in_year = years_to_months[year]
+        if not months_in_year:
+            continue
+            
+        start_col, end_col = year_to_cols[year]
+        
+        ws.cell(row=curr_row, column=1).value = f"Wskaźnik sezonowości Rok {year}"
+        ws.cell(row=curr_row, column=1).font = Font(bold=True)
+        ws.cell(row=curr_row+1, column=1).value = "Miesiąc"
+        ws.cell(row=curr_row+2, column=1).value = "Wynik miesięczny"
+        ws.cell(row=curr_row+3, column=1).value = "Średnia"
+        ws.cell(row=curr_row+4, column=1).value = "Odchylenie (+/-)"
+        ws.cell(row=curr_row+5, column=1).value = "Wskaźnik (%)"
+        
+        for r_offset in range(1, 6):
+            ws.cell(row=curr_row+r_offset, column=1).font = Font(bold=True)
+            
+        # Wypisanie miesięcy 
+        col_idx = 2
+        first_month_col_letter = get_column_letter(col_idx)
+        last_month_col_letter = get_column_letter(col_idx + len(months_in_year) - 1)
+        avg_formula = f"=AVERAGE({first_month_col_letter}{curr_row+2}:{last_month_col_letter}{curr_row+2})"
+        
+        for i, m in enumerate(months_in_year):
+            c_current = col_idx + i
+            c_letter = get_column_letter(c_current)
+            orig_col_letter = get_column_letter(start_col + i)
+            
+            # Miesiąc
+            c_month = ws.cell(row=curr_row+1, column=c_current)
+            c_month.value = _month_label_pl(m)
+            c_month.alignment = Alignment(horizontal='center')
+            
+            # Wynik miesięczny
+            c_wynik = ws.cell(row=curr_row+2, column=c_current)
+            c_wynik.value = f"={orig_col_letter}{sum_row}"
+            c_wynik.number_format = '#,##0.00'
+            
+            # Średnia
+            c_srednia = ws.cell(row=curr_row+3, column=c_current)
+            c_srednia.value = avg_formula
+            c_srednia.number_format = '#,##0.00'
+            
+            # Odchylenie
+            c_odchylenie = ws.cell(row=curr_row+4, column=c_current)
+            c_odchylenie.value = f"={c_letter}{curr_row+2}-{c_letter}{curr_row+3}"
+            c_odchylenie.number_format = '#,##0.00'
+            
+            # Wskaźnik
+            c_wskaznik = ws.cell(row=curr_row+5, column=c_current)
+            c_wskaznik.value = f"=IFERROR({c_letter}{curr_row+2}/{c_letter}{curr_row+3}, 0)"
+            c_wskaznik.number_format = '0.00%'
+            
+        curr_row += 7
 
     # Remove gridlines
     ws.sheet_view.showGridLines = False
@@ -4430,6 +4809,9 @@ def export_to_excel_PL(
     carrier_order = [code for code in preferred_order if code in detected_carriers]
     carrier_order += [code for code in detected_carriers if code not in carrier_order]
 
+    # === KONFIGURACJA KOLUMN (NOWA KOLEJNOŚĆ) ===
+
+    # 1. INFO
     num1_col = 1
     info_nr_col = 2
     info_loc_col = 3
@@ -4437,8 +4819,25 @@ def export_to_excel_PL(
     info_start_col = info_nr_col
     info_end_col = info_type_col
 
+    # 2. PODSUMOWANIE (Przeniesione na 2. miejsce)
     num2_col = info_end_col + 1
-    carrier_start_col = num2_col + 1
+    podsum_start_col = num2_col + 1
+    podsum_cols = {
+        'koszty': podsum_start_col,
+        'przychody': podsum_start_col + 1,
+        'brutto_suma': podsum_start_col + 2,
+        'netto_suma': podsum_start_col + 3,
+        'karta_suma': podsum_start_col + 4,
+        'blik_suma': podsum_start_col + 5,
+        'gotowka_suma': podsum_start_col + 6,
+        'bilety_suma': podsum_start_col + 7,
+        'profit_loss': podsum_start_col + 8,
+    }
+    podsum_end_col = podsum_start_col + 8
+
+    # 3. DANE PRZEWOŹNIKÓW (Przesunięte na 3. miejsce)
+    num3_col = podsum_end_col + 1
+    carrier_start_col = num3_col + 1
     carrier_columns = {}
     col_cursor = carrier_start_col
     for code in carrier_order:
@@ -4455,8 +4854,9 @@ def export_to_excel_PL(
         col_cursor += 6
     carrier_end_col = col_cursor - 1
 
-    num3_col = carrier_end_col + 1
-    tickets_start_col = num3_col + 1
+    # 4. LICZBA BILETÓW (Przesunięte na 4. miejsce)
+    num4_col = carrier_end_col + 1
+    tickets_start_col = num4_col + 1
     ticket_columns = {}
     col_cursor = tickets_start_col
     for code in carrier_order:
@@ -4464,8 +4864,9 @@ def export_to_excel_PL(
         col_cursor += 1
     tickets_end_col = col_cursor - 1
 
-    num4_col = tickets_end_col + 1
-    przychody_start_col = num4_col + 1
+    # 5. PRZYCHODY (Przesunięte na 5. miejsce)
+    num5_col = tickets_end_col + 1
+    przychody_start_col = num5_col + 1
     przychody_cols = {
         'prowizja_suma': przychody_start_col,
         'interchange': przychody_start_col + 1,
@@ -4473,8 +4874,9 @@ def export_to_excel_PL(
     }
     przychody_end_col = przychody_start_col + 2
 
-    num5_col = przychody_end_col + 1
-    koszty_start_col = num5_col + 1
+    # 6. KOSZTY (Przesunięte na 6. miejsce)
+    num6_col = przychody_end_col + 1
+    koszty_start_col = num6_col + 1
     tvm_cost_cols = {}
     col_cursor = koszty_start_col
     for key in TVM_COST_KEYS:
@@ -4489,35 +4891,21 @@ def export_to_excel_PL(
     dodatkowe_koszty_col = col_cursor
     koszty_end_col = dodatkowe_koszty_col
 
-    num6_col = koszty_end_col + 1
-    podsum_start_col = num6_col + 1
-    podsum_cols = {
-        'koszty': podsum_start_col,
-        'przychody': podsum_start_col + 1,
-        'brutto_suma': podsum_start_col + 2,
-        'netto_suma': podsum_start_col + 3,
-        'karta_suma': podsum_start_col + 4,
-        'blik_suma': podsum_start_col + 5,
-        'gotowka_suma': podsum_start_col + 6,
-        'bilety_suma': podsum_start_col + 7,
-        'profit_loss': podsum_start_col + 8,
-    }
-    podsum_end_col = podsum_start_col + 8
-    num7_col = podsum_end_col + 1
+    # 7. UWAGI
+    num7_col = koszty_end_col + 1
     uwagi_col_idx = num7_col + 1
     result_col_idx = podsum_cols['profit_loss']
+
+    # --- RENDEROWANIE NAGŁÓWKÓW (TITLE ROW) ---
 
     if info_start_col <= info_end_col:
         ws.merge_cells(start_row=title_row, start_column=info_start_col, end_row=title_row, end_column=info_end_col)
     ws.cell(row=title_row, column=info_start_col, value='INFO')
-    _set_cell_style(
-        title_row,
-        info_start_col,
-        fill=title_fill,
-        font=title_font,
-        alignment=Alignment(horizontal='center', vertical='center'),
-        border=thin_border,
-    )
+    _set_cell_style(title_row, info_start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
+
+    ws.merge_cells(start_row=title_row, start_column=podsum_start_col, end_row=title_row, end_column=podsum_end_col)
+    ws.cell(row=title_row, column=podsum_start_col, value='Podsumowanie')
+    _set_cell_style(title_row, podsum_start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     if carrier_order:
         for code in carrier_order:
@@ -4525,70 +4913,24 @@ def export_to_excel_PL(
             end_col = carrier_columns[code]['end']
             ws.merge_cells(start_row=title_row, start_column=start_col, end_row=title_row, end_column=end_col)
             ws.cell(row=title_row, column=start_col, value=_carrier_header_label(code))
-            _set_cell_style(
-                title_row,
-                start_col,
-                fill=title_fill,
-                font=title_font,
-                alignment=Alignment(horizontal='center', vertical='center'),
-                border=thin_border,
-            )
+            _set_cell_style(title_row, start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     if ticket_columns:
         if tickets_start_col < tickets_end_col:
             ws.merge_cells(start_row=title_row, start_column=tickets_start_col, end_row=title_row, end_column=tickets_end_col)
-        ws.cell(row=title_row, column=tickets_start_col, value='Liczba bilet\u00f3w')
-        _set_cell_style(
-            title_row,
-            tickets_start_col,
-            fill=title_fill,
-            font=title_font,
-            alignment=Alignment(horizontal='center', vertical='center'),
-            border=thin_border,
-        )
+        ws.cell(row=title_row, column=tickets_start_col, value='Liczba biletów')
+        _set_cell_style(title_row, tickets_start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     ws.merge_cells(start_row=title_row, start_column=przychody_start_col, end_row=title_row, end_column=przychody_end_col)
     ws.cell(row=title_row, column=przychody_start_col, value='Przychody')
-    _set_cell_style(
-        title_row,
-        przychody_start_col,
-        fill=title_fill,
-        font=title_font,
-        alignment=Alignment(horizontal='center', vertical='center'),
-        border=thin_border,
-    )
+    _set_cell_style(title_row, przychody_start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     ws.merge_cells(start_row=title_row, start_column=koszty_start_col, end_row=title_row, end_column=koszty_end_col)
     ws.cell(row=title_row, column=koszty_start_col, value='KOSZTY')
-    _set_cell_style(
-        title_row,
-        koszty_start_col,       
-        fill=title_fill,
-        font=title_font,
-        alignment=Alignment(horizontal='center', vertical='center'),
-        border=thin_border,
-    )
-
-    ws.merge_cells(start_row=title_row, start_column=podsum_start_col, end_row=title_row, end_column=podsum_end_col)
-    ws.cell(row=title_row, column=podsum_start_col, value='Podsumowanie')
-    _set_cell_style(
-        title_row,
-        podsum_start_col,
-        fill=title_fill,
-        font=title_font,
-        alignment=Alignment(horizontal='center', vertical='center'),
-        border=thin_border,
-    )
+    _set_cell_style(title_row, koszty_start_col, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     ws.cell(row=title_row, column=uwagi_col_idx, value='Uwagi')
-    _set_cell_style(
-        title_row,
-        uwagi_col_idx,
-        fill=title_fill,
-        font=title_font,
-        alignment=Alignment(horizontal='center', vertical='center'),
-        border=thin_border,
-    )
+    _set_cell_style(title_row, uwagi_col_idx, fill=title_fill, font=title_font, alignment=Alignment(horizontal='center', vertical='center'), border=thin_border)
 
     header_values = {
         info_nr_col: 'Nr TVM',
@@ -4818,10 +5160,7 @@ def export_to_excel_PL(
         ws.cell(row=row_num, column=podsum_cols['profit_loss']).number_format = '#,##0.00'
         profit_loss_by_device[device_id] = float(row_profit_loss)
         tickets_by_device[device_id] = row_ticket_total
-        if device_id in rop_eligible_ids or device_id in relocation_active_device_ids:
-            ws.cell(row=row_num, column=uwagi_col_idx, value=None)
-        else:
-            ws.cell(row=row_num, column=uwagi_col_idx, value='do sprawdzenia')
+        ws.cell(row=row_num, column=uwagi_col_idx, value=None)
         row_num += 1
 
     last_data_row = row_num - 1
@@ -4954,6 +5293,16 @@ def export_to_excel_PL(
             # Special case to give a bit more for small columns and limit max width
             new_width = max_len * 1.1
             ws.column_dimensions[get_column_letter(col_num)].width = max(new_width, 4)
+    
+    # Set fixed width for Uwagi column
+    ws.column_dimensions[get_column_letter(uwagi_col_idx)].width = 18
+
+    # Set Nr TVM column width to header length + 10 characters margin
+    try:
+        nr_header = header_values.get(info_nr_col, 'Nr TVM')
+        ws.column_dimensions[get_column_letter(info_nr_col)].width = max(len(str(nr_header)) + 10, 6)
+    except Exception:
+        pass
 
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 100
@@ -4993,58 +5342,63 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
     """
     ws = wb.create_sheet(title='Tickets_Summary')
     ordered_months = sorted(month_to_tickets.keys())
-    headers = ['Nr aut.'] + [f"Bilety {_month_label_pl(m)}" for m in ordered_months] + ['Suma']
 
-    if ordered_months:
-        year_to_month_positions = {}
-        for month_idx, month_str in enumerate(ordered_months, start=2):
-            year = int(month_str.split('-')[0])
-            year_to_month_positions.setdefault(year, []).append(month_idx)
+    # Group months by year
+    years_to_months = {}
+    for m in ordered_months:
+        year = int(m.split('-')[0])
+        years_to_months.setdefault(year, []).append(m)
 
-        for year, columns in sorted(year_to_month_positions.items()):
-            start_col = min(columns)
-            end_col = max(columns)
-            if start_col == end_col:
-                year_cell = ws.cell(row=1, column=start_col)
-                year_cell.value = f"Rok {year}"
-                year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-                year_cell.fill = PatternFill(start_color='385723', end_color='385723', fill_type='solid')
-                year_cell.alignment = Alignment(horizontal='center', vertical='center')
-                continue
+    # Build headers with per-year grouped months and yearly SUM, plus final Average
+    headers = ['Nr aut.']
+    month_col_positions = {}
+    year_to_cols = {}
+    current_col = 2
+    for year in sorted(years_to_months.keys()):
+        start_col = current_col
+        for m in years_to_months[year]:
+            headers.append(f"Bilety {_month_label_pl(m)}")
+            month_col_positions[m] = current_col
+            current_col += 1
+        headers.append('Zestawienie roczne (+/-)')
+        end_col = current_col
+        year_to_cols[year] = (start_col, end_col)
+        current_col += 1
 
+    headers.append('Średnia')
+
+    # Create year header row with merged cells
+    ws.cell(row=1, column=1).value = ''
+    ws.cell(row=1, column=1).fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+    for year, (start_col, end_col) in year_to_cols.items():
+        if start_col == end_col:
+            year_cell = ws.cell(row=1, column=start_col)
+        else:
             ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
             year_cell = ws.cell(row=1, column=start_col)
-            year_cell.value = f"Rok {year}"
-            year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-            year_cell.fill = PatternFill(start_color='385723', end_color='385723', fill_type='solid')
-            year_cell.alignment = Alignment(horizontal='center', vertical='center')
+        year_cell.value = f"Rok {year}"
+        year_cell.font = Font(bold=True, color='FFFFFF', size=12)
+        year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        year_cell.alignment = Alignment(horizontal='center', vertical='center')
 
-    ws.cell(row=1, column=1).value = ''
-    ws.cell(row=1, column=1).fill = PatternFill(start_color='385723', end_color='385723', fill_type='solid')
-
-    sum_col = len(headers)
     sum_fill = PatternFill(start_color='BFBFBF', end_color='BFBFBF', fill_type='solid')
     sum_font = Font(bold=True, color='000000')
     sum_data_alignment = Alignment(horizontal='right', vertical='center')
 
-    ws.cell(row=1, column=sum_col).value = ''
-    ws.cell(row=1, column=sum_col).fill = sum_fill
-
+    # Column headers (row 2)
     header_row = 2
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col_num)
         cell.value = header
-        
-        if col_num == sum_col:
+        if col_num == 1:
+            cell.font = Font(bold=True, color='FFFFFF')
+            cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        elif header in ('Zestawienie roczne (+/-)', 'Średnia'):
             cell.font = sum_font
             cell.fill = sum_fill
-        elif col_num == 1:
-            cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill(start_color='385723', end_color='385723', fill_type='solid')
         else:
             cell.font = Font(bold=True, color='FFFFFF')
-            cell.fill = PatternFill(start_color='548235', end_color='548235', fill_type='solid')
-        
+            cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
         cell.alignment = Alignment(horizontal='center', vertical='center')
 
     all_device_ids = sorted({
@@ -5054,40 +5408,91 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
     })
 
     row_num = 3
+    total_months = len(ordered_months)
     for device_id in all_device_ids:
         ws.cell(row=row_num, column=1).value = device_id
-        monthly_sum = 0
         col_idx = 2
-        for month_str in ordered_months:
-            value = int(month_to_tickets.get(month_str, {}).get(device_id, 0) or 0)
-            cell = ws.cell(row=row_num, column=col_idx)
-            cell.value = value
-            cell.number_format = '#,##0'
-            monthly_sum += value
+        # Fill monthly values grouped by year and insert yearly SUM formula
+        for year in sorted(years_to_months.keys()):
+            first_month_col = get_column_letter(col_idx)
+            for m in years_to_months[year]:
+                value = int(month_to_tickets.get(m, {}).get(device_id, 0) or 0)
+                cell = ws.cell(row=row_num, column=col_idx)
+                cell.value = value
+                cell.number_format = '#,##0'
+                col_idx += 1
+
+            last_month_col = get_column_letter(col_idx - 1)
+            sum_cell = ws.cell(row=row_num, column=col_idx)
+            sum_cell.value = f"=SUM({first_month_col}{row_num}:{last_month_col}{row_num})"
+            sum_cell.number_format = '#,##0'
+            sum_cell.fill = sum_fill
+            sum_cell.font = sum_font
+            sum_cell.alignment = sum_data_alignment
             col_idx += 1
 
-        sum_cell = ws.cell(row=row_num, column=col_idx)
-        sum_cell.value = monthly_sum
-        sum_cell.number_format = '#,##0'
-        sum_cell.fill = sum_fill
-        sum_cell.font = sum_font
-        sum_cell.alignment = sum_data_alignment
-        
-        # Osobna reguła formatowania ColorScaleRule dla kazdego z wierszy
-        if len(ordered_months) > 1:
-            row_range = f"{get_column_letter(2)}{row_num}:{get_column_letter(len(headers) - 1)}{row_num}"
-            scale_rule = ColorScaleRule(start_type='min', start_color='FFC7CE',
-                                        mid_type='percentile', mid_value=50, mid_color='FFEB9C',
-                                        end_type='max', end_color='C6EFCE')
-            ws.conditional_formatting.add(row_range, scale_rule)
+        # Average across all month columns (exclude the yearly SUM columns)
+        if total_months > 0:
+            first_value_col_letter = get_column_letter(2)
+            last_month_col_letter = get_column_letter(2 + total_months - 1)
+            avg_cell = ws.cell(row=row_num, column=col_idx)
+            avg_cell.value = f'=AVERAGEIF({first_value_col_letter}{row_num}:{last_month_col_letter}{row_num}, "<>0")'
+            avg_cell.number_format = '#,##0.00'
+            avg_cell.fill = sum_fill
+            avg_cell.font = sum_font
+            avg_cell.alignment = sum_data_alignment
+
+        # Color scale for monthly values only (exclude yearly and average columns)
+        if total_months > 1:
+            for year in sorted(years_to_months.keys()):
+                month_cols = [month_col_positions[m] for m in years_to_months[year] if m in month_col_positions]
+                if len(month_cols) <= 1:
+                    continue
+                year_month_range = f"{get_column_letter(month_cols[0])}{row_num}:{get_column_letter(month_cols[-1])}{row_num}"
+                scale_rule = ColorScaleRule(start_type='min', start_color='FFC7CE',
+                                            mid_type='percentile', mid_value=50, mid_color='FFEB9C',
+                                            end_type='max', end_color='C6EFCE')
+                ws.conditional_formatting.add(year_month_range, scale_rule)
 
         row_num += 1
+
+    last_data_row = row_num - 1
+
+    # Podsumowanie dla każdego miesiąca (Suma)
+    sum_row = row_num
+    ws.cell(row=sum_row, column=1).value = "Suma biletów"
+    ws.cell(row=sum_row, column=1).font = sum_font
+    ws.cell(row=sum_row, column=1).fill = sum_fill
+    for col in range(2, len(headers) + 1):
+        col_letter = get_column_letter(col)
+        cell = ws.cell(row=sum_row, column=col)
+        cell.value = f"=SUM({col_letter}3:{col_letter}{last_data_row})"
+        cell.number_format = '#,##0'
+        cell.font = sum_font
+        cell.fill = sum_fill
+        if ws.cell(row=2, column=col).value in ('Zestawienie roczne (+/-)', 'Średnia'):
+            cell.alignment = sum_data_alignment
+
+    row_num += 1
 
     thin_side = Side(style='thin', color='000000')
     thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
     for row in range(2, row_num):
         for col in range(1, len(headers) + 1):
             ws.cell(row=row, column=col).border = thin_border
+
+    # Additional April conditional formatting (column-wise, per each April present)
+    april_months = [m for m in ordered_months if m.endswith('-04')]
+    if row_num > 3:
+        for april_month in april_months:
+            april_col = month_col_positions.get(april_month)
+            if april_col is None:
+                continue
+            april_range = f"{get_column_letter(april_col)}3:{get_column_letter(april_col)}{row_num - 1}"
+            april_scale = ColorScaleRule(start_type='min', start_color='FFC7CE',
+                                         mid_type='percentile', mid_value=50, mid_color='FFEB9C',
+                                         end_type='max', end_color='C6EFCE')
+            ws.conditional_formatting.add(april_range, april_scale)
 
     # Adjust column widths (10% extra margin)
     for col in range(1, len(headers) + 1):
@@ -5099,6 +5504,63 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
         if max_len > 0:
             ws.column_dimensions[get_column_letter(col)].width = max_len * 1.1
 
+    # Tabela sezonowości
+    curr_row = row_num + 2
+    for year in sorted(years_to_months.keys()):
+        months_in_year = years_to_months[year]
+        if not months_in_year:
+            continue
+            
+        start_col, end_col = year_to_cols[year]
+        
+        ws.cell(row=curr_row, column=1).value = f"Wskaźnik sezonowości Rok {year}"
+        ws.cell(row=curr_row, column=1).font = Font(bold=True)
+        ws.cell(row=curr_row+1, column=1).value = "Miesiąc"
+        ws.cell(row=curr_row+2, column=1).value = "Suma biletów"
+        ws.cell(row=curr_row+3, column=1).value = "Średnia miesięczna z przypisanych"
+        ws.cell(row=curr_row+4, column=1).value = "Odchylenie (+/-)"
+        ws.cell(row=curr_row+5, column=1).value = "Wskaźnik (%)"
+        
+        for r_offset in range(1, 6):
+            ws.cell(row=curr_row+r_offset, column=1).font = Font(bold=True)
+            
+        col_idx = 2
+        first_month_col_letter = get_column_letter(col_idx)
+        last_month_col_letter = get_column_letter(col_idx + len(months_in_year) - 1)
+        avg_formula = f'=AVERAGEIF({first_month_col_letter}{curr_row+2}:{last_month_col_letter}{curr_row+2}, "<>0")'
+        
+        for i, m in enumerate(months_in_year):
+            c_current = col_idx + i
+            c_letter = get_column_letter(c_current)
+            orig_col_letter = get_column_letter(start_col + i)
+            
+            # Miesiąc
+            c_month = ws.cell(row=curr_row+1, column=c_current)
+            c_month.value = _month_label_pl(m)
+            c_month.alignment = Alignment(horizontal='center')
+            
+            # Suma biletów
+            c_wynik = ws.cell(row=curr_row+2, column=c_current)
+            c_wynik.value = f"={orig_col_letter}{sum_row}"
+            c_wynik.number_format = '#,##0'
+            
+            # Średnia
+            c_srednia = ws.cell(row=curr_row+3, column=c_current)
+            c_srednia.value = avg_formula
+            c_srednia.number_format = '#,##0.00'
+            
+            # Odchylenie
+            c_odchylenie = ws.cell(row=curr_row+4, column=c_current)
+            c_odchylenie.value = f"={c_letter}{curr_row+2}-{c_letter}{curr_row+3}"
+            c_odchylenie.number_format = '#,##0.00'
+            
+            # Wskaźnik
+            c_wskaznik = ws.cell(row=curr_row+5, column=c_current)
+            c_wskaznik.value = f"=IFERROR({c_letter}{curr_row+2}/{c_letter}{curr_row+3}, 0)"
+            c_wskaznik.number_format = '0.00%'
+            
+        curr_row += 7
+
     ws.sheet_view.showGridLines = False
 
 
@@ -5109,10 +5571,10 @@ def _create_wyszukiwarka_sheet(wb):
     ws = wb.create_sheet(title='Wyszukiwarka')
     
     # 1. Styl nagłówka ogólnego
-    ws.merge_cells('A1:H1')
+    ws.merge_cells('A1:T2')
     title_cell = ws['A1']
     title_cell.value = 'WYSZUKIWARKA TVM - PORÓWNANIE DWÓCH OKRESÓW'
-    title_cell.font = Font(bold=True, color='FFFFFF', size=12)
+    title_cell.font = Font(bold=True, color='FFFFFF', size=16)
     title_cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
     title_cell.alignment = Alignment(horizontal='center', vertical='center')
 
@@ -5129,48 +5591,49 @@ def _create_wyszukiwarka_sheet(wb):
     ws.column_dimensions['B'].width = 15
     ws.column_dimensions['C'].width = 15
     ws.column_dimensions['D'].width = 15
+    ws.column_dimensions['E'].width = 15
 
     # 2. Panel wejściowy (Nr automatu, Okres 1, Okres 2)
-    ws['A3'].value = 'NR AUTOMATU:'
-    ws['A3'].font = Font(bold=True)
-    ws['A3'].border = thin_border
+    ws['A4'].value = 'NR AUTOMATU:'
+    ws['A4'].font = Font(bold=True)
+    ws['A4'].border = thin_border
     
-    ws['B3'].value = '1103'  # Przykładowa/domyślna wartość
-    ws['B3'].alignment = Alignment(horizontal='center')
-    ws['B3'].border = thin_border
+    ws['B4'].value = '1132'  # Przykładowa/domyślna wartość
+    ws['B4'].alignment = Alignment(horizontal='center')
+    ws['B4'].border = thin_border
 
     # Tabela z wyborem roków/miesięcy
-    ws['B5'].value = 'ROK'
-    ws['B5'].border = thin_border
-    ws['B5'].alignment = Alignment(horizontal='center')
-    
-    ws['C5'].value = 'Miesiąc'
-    ws['C5'].border = thin_border
-    ws['C5'].alignment = Alignment(horizontal='center')
-
-    ws['A6'].value = 'OKRES 1:'
-    ws['A6'].font = Font(bold=True)
-    ws['A6'].border = thin_border
-
-    ws['B6'].value = '2025'
-    ws['B6'].alignment = Alignment(horizontal='center')
+    ws['B6'].value = 'ROK'
     ws['B6'].border = thin_border
+    ws['B6'].alignment = Alignment(horizontal='center')
     
-    ws['C6'].value = 'Kwiecień'
-    ws['C6'].alignment = Alignment(horizontal='center')
+    ws['C6'].value = 'Miesiąc'
     ws['C6'].border = thin_border
+    ws['C6'].alignment = Alignment(horizontal='center')
 
-    ws['A7'].value = 'OKRES 2:'
+    ws['A7'].value = 'OKRES 1:'
     ws['A7'].font = Font(bold=True)
     ws['A7'].border = thin_border
 
     ws['B7'].value = '2026'
     ws['B7'].alignment = Alignment(horizontal='center')
     ws['B7'].border = thin_border
-
-    ws['C7'].value = 'Marzec'
+    
+    ws['C7'].value = 'Luty'
     ws['C7'].alignment = Alignment(horizontal='center')
     ws['C7'].border = thin_border
+
+    ws['A8'].value = 'OKRES 2:'
+    ws['A8'].font = Font(bold=True)
+    ws['A8'].border = thin_border
+
+    ws['B8'].value = '2025'
+    ws['B8'].alignment = Alignment(horizontal='center')
+    ws['B8'].border = thin_border
+
+    ws['C8'].value = 'Sierpień'
+    ws['C8'].alignment = Alignment(horizontal='center')
+    ws['C8'].border = thin_border
 
     # 3. Tabela wynikowa
     header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
@@ -5178,7 +5641,7 @@ def _create_wyszukiwarka_sheet(wb):
     
     headers = ['Brutto', 'Netto', 'Przychody', 'Koszty']
     for idx, text in enumerate(headers, start=2):  # Kolumny B, C, D, E (index 2-5)
-        cell = ws.cell(row=11, column=idx)
+        cell = ws.cell(row=12, column=idx)
         cell.value = text
         cell.font = header_font
         cell.fill = header_fill
@@ -5186,19 +5649,19 @@ def _create_wyszukiwarka_sheet(wb):
         cell.border = thin_border
 
     # Komórki z etykietami okresów w tabeli i obramowaniami
-    ws['A12'].value = 'Kwiecień 2025' # Do podmiany przez VBA
-    ws['A12'].font = header_font
-    ws['A12'].fill = header_fill
-    ws['A12'].alignment = Alignment(horizontal='center', vertical='center')
-    ws['A12'].border = thin_border
-
-    ws['A13'].value = 'Marzec 2026'   # Do podmiany przez VBA
+    ws['A13'].value = 'Luty 2026' # Do podmiany przez VBA
     ws['A13'].font = header_font
     ws['A13'].fill = header_fill
     ws['A13'].alignment = Alignment(horizontal='center', vertical='center')
     ws['A13'].border = thin_border
 
-    for row in [12, 13]:
+    ws['A14'].value = 'Sierpień 2025'   # Do podmiany przez VBA
+    ws['A14'].font = header_font
+    ws['A14'].fill = header_fill
+    ws['A14'].alignment = Alignment(horizontal='center', vertical='center')
+    ws['A14'].border = thin_border
+
+    for row in [13, 14]:
         for col in range(2, 6): # B do E
             cell = ws.cell(row=row, column=col)
             cell.border = thin_border
@@ -5219,30 +5682,16 @@ def export_multi_month_PL(
     amortyzacja_sheet=DEFAULT_AMORTYZACJA_SHEET,
 ):
     """
-    Eksportuje wiele miesięcy do jednego skoroszytu oraz dodaje arkusz Profit/loss.
+    Eksportuje wiele miesięcy do jednego skoroszytu.
     """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filepath = OUTPUT_DIR / filename
     wb = Workbook()
 
-    month_to_profit_loss = {}
-    month_to_tickets = {}
-    month_to_commission_sum = {}
-    
     for month_str, payload in month_payloads:
-        commission_data = build_monthly_commission_data_from_rules(
-            payload.get('revenue_data') or {},
-            payload.get('commission_rules') or {},
-            month_str,
-        )
-        month_to_commission_sum[month_str] = sum(
-            float(entry.get('prowizja_zl', 0.0) or 0.0)
-            for entry in commission_data.values()
-        )
-
         warehouse_ids = payload.get('warehouse_device_ids') or set()
 
-        sheet_result = export_to_excel_PL(
+        export_to_excel_PL(
             dictionary_comparison,
             payload['revenue_data'],
             month_str,
@@ -5265,13 +5714,17 @@ def export_multi_month_PL(
             warehouse_device_ids=warehouse_ids,
             included_device_ids=payload.get('included_device_ids') or [],
         )
-        month_to_profit_loss[month_str] = sheet_result['profit_loss_by_device']
-        month_to_tickets[month_str] = sheet_result['tickets_by_device']
-
-    _create_profit_loss_summary_sheet(wb, month_to_profit_loss)
-    _create_tickets_summary_sheet(wb, month_to_tickets)
     _create_wyszukiwarka_sheet(wb)
-    wb.save(filepath)
+    
+    # Zapisz jako .xlsx najpierw
+    temp_xlsx_path = filepath.with_suffix('.xlsx')
+    wb.save(temp_xlsx_path)
+    
+    # Ładuj kody VBA z plików
+    vba_modules_dict = _get_vba_modules_dict()
+    
+    # Konwertuj .xlsx → .xlsm z VBA
+    _convert_xlsx_to_xlsm_with_vba(temp_xlsx_path, filepath, vba_modules_dict)
     print(f"\n✓ Raport P&L eksportowany (wieloarkuszowy): {filepath}")
 
 
@@ -5335,16 +5788,32 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
         device_ids=included_device_ids,
     )
 
-    location_by_device = {
-        int(device_id): location
-        for device_id, location in xlsx_location_by_device.items()
-        if int(device_id) in included_device_ids_set
-    }
+    # 1) Prefer locations from "lista automatow" (highest priority)
+    resolved_lista_file = _resolve_lista_automatow_file_for_month(
+        month_str,
+        getattr(args, 'lista_automatow_file', DEFAULT_LISTA_AUTOMATOW_FILE),
+    )
+    lista_location_map = _load_lista_automatow_locations_from_xlsx(
+        lista_file=resolved_lista_file,
+        month_str=month_str,
+    )
 
+    # Initialize from lista (priority), then fill from xlsx (prowizje) if missing
+    location_by_device = {}
+    for device_id, location in lista_location_map.items():
+        if device_id in included_device_ids_set and location:
+            location_by_device[device_id] = location
+
+    for device_id, location in xlsx_location_by_device.items():
+        if device_id in included_device_ids_set and device_id not in location_by_device and location:
+            location_by_device[device_id] = location
+
+    # Apply relocations (overrides lista/xlsx)
     for device_id, location in relocation_location_by_device.items():
         if device_id in included_device_ids_set and location:
             location_by_device[device_id] = location
 
+    # Service overrides (as before) — may override previous values
     year = int(month_str.split('-')[0])
     service_cost_by_device = {}
     if year >= 2026:
@@ -5362,15 +5831,6 @@ def _build_month_export_payload(conn, month_str, args, dictionary_comparison, re
             for device_id, value in service_cost_map.items()
             if int(device_id) in included_device_ids_set
         }
-    elif year == 2025:
-        resolved_lista_file = _resolve_lista_automatow_file_for_month(month_str, args.lista_automatow_file)
-        lista_location_map = _load_lista_automatow_locations_from_xlsx(
-            lista_file=resolved_lista_file,
-            month_str=month_str,
-        )
-        for device_id, location in lista_location_map.items():
-            if device_id in included_device_ids_set and location:
-                location_by_device[device_id] = location
 
     missing_location_ids = [device_id for device_id in included_device_ids if device_id not in location_by_device]
     if missing_location_ids:
@@ -5707,7 +6167,7 @@ def main():
     parser.add_argument(
         '--month-payload-source',
         choices=['auto', 'fresh', 'cache-only', 'no-cache'],
-        default='auto',
+        default='fresh',
         help='Źródło payloadu miesięcznego: auto (cache z fallback), fresh (pełne pobranie + zapis cache), cache-only (tylko cache), no-cache (pełne pobranie bez odczytu i bez zapisu cache)'
     )
     parser.add_argument(
