@@ -285,7 +285,35 @@ def _convert_xlsx_to_xlsm_with_vba(xlsx_path, xlsm_path, vba_modules_dict):
     
     excel = None
     try:
-        excel = win32.Dispatch("Excel.Application")
+        # Kill any existing Excel processes to avoid COM conflicts
+        import subprocess
+        try:
+            subprocess.run(['taskkill', '/F', '/IM', 'excel.exe'], 
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            time.sleep(1)
+        except Exception:
+            pass
+        
+        # Initialize Excel COM object with retries
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                excel = win32.Dispatch("Excel.Application")
+                time.sleep(0.5)
+                # Test that the object is valid
+                test = excel.Name
+                print(f"✓ Excel COM object initialized (attempt {attempt})")
+                break
+            except Exception as e:
+                print(f"⚠️ Attempt {attempt} to initialize Excel failed: {e}")
+                excel = None
+                time.sleep(1)
+                if attempt == max_retries:
+                    raise Exception("Could not initialize Excel COM object after retries")
+        
+        if not excel:
+            raise Exception("Excel object is None")
+        
         try:
             excel.Visible = False
         except Exception as e:
@@ -295,12 +323,20 @@ def _convert_xlsx_to_xlsm_with_vba(xlsx_path, xlsm_path, vba_modules_dict):
         except Exception as e:
             print(f"⚠️ Nie udało się ustawić DisplayAlerts=False: {e}")
         
-        wb = excel.Workbooks.Open(str(xlsx_path))
+        # Open workbook with explicit validation
+        try:
+            wb = excel.Workbooks.Open(str(xlsx_path))
+        except AttributeError as e:
+            print(f"❌ Excel.Application.Workbooks not accessible: {e}")
+            print(f"   Excel object type: {type(excel)}")
+            print(f"   Excel object dir: {[x for x in dir(excel) if 'Work' in x]}")
+            raise
+        
+        time.sleep(1)  # Czekaj, aż Excel zainicjalizuje workbook
 
         try:
             _ = wb.VBProject.VBComponents.Count
         except Exception as e:
-            trust_hint = "Programistyczny dostęp do projektu w języku Visual Basic nie jest zaufany"
             if trust_hint in str(e):
                 print(
                     "⚠️ Excel blokuje dostęp do VBProject. Aby wstrzyknąć VBA, włącz w Excelu: "
@@ -376,6 +412,7 @@ def _convert_xlsx_to_xlsm_with_vba(xlsx_path, xlsm_path, vba_modules_dict):
                 return
 
         # Try multiple save strategies to avoid COM SaveAs failures
+        time.sleep(0.5)  # Krótka pauza przed zapisem
         saved = False
         try:
             wb.SaveAs(str(xlsm_path), FileFormat=52)
@@ -3973,11 +4010,15 @@ def _month_label_pl(month_str):
     return labels.get(month_no, month_str)
 
 
-def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
+def _create_profit_loss_summary_sheet(wb, month_to_profit_loss, location_by_device=None):
     """
     Tworzy 3. arkusz zbiorczy Profit/loss per automat z podziałem i sumowaniem rocznym.
     Wszystkie wartości pozostają liczbowe, także dla urządzeń magazynowych.
+    Zawiera wiersze metryk na górze: Procent rentowności i Liczba TVM rentownych.
     """
+    if location_by_device is None:
+        location_by_device = {}
+    
     ws = wb.create_sheet(title='ProfitLoss_Summary')
     ordered_months = sorted(month_to_profit_loss.keys())
     
@@ -3988,8 +4029,8 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
         years_to_months.setdefault(year, []).append(m)
         
     year_to_cols = {}
-    headers = ['Nr aut.']
-    current_col = 2
+    headers = ['Nr aut.', 'Lokalizacja automatu']
+    current_col = 3
     
     # 2. Build headers dynamically
     for year in sorted(years_to_months.keys()):
@@ -4002,48 +4043,69 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
         year_to_cols[year] = (start_col, end_col)
         current_col += 1
 
-    # 3. Create the Year Group Header (Row 1)
-    ws.cell(row=1, column=1).value = ''
-    ws.cell(row=1, column=1).fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+    # 3. Merge cells for metric labels (Rows 1-2)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=2)
+
+    percent_cell = ws.cell(row=1, column=1)
+    percent_cell.value = "Procent rentowności"
+    percent_cell.font = Font(bold=True, color='FFFFFF', size=11)
+    percent_cell.fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+    percent_cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    count_cell = ws.cell(row=2, column=1)
+    count_cell.value = "Liczba TVM"
+    count_cell.font = Font(bold=True, color='FFFFFF', size=11)
+    count_cell.fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+    count_cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # 3a. Year bar row.
+    year_bar_fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+    year_bar_font = Font(bold=True, color='FFFFFF', size=11)
+    for col_num in range(1, current_col):
+        ws.cell(row=3, column=col_num).fill = year_bar_fill
 
     for year, (start_col, end_col) in year_to_cols.items():
-        if start_col == end_col:
-            year_cell = ws.cell(row=1, column=start_col)
-        else:
-            ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
-            year_cell = ws.cell(row=1, column=start_col)
-            
-        year_cell.value = f"Rok {year}"
-        year_cell.font = Font(bold=True, color='FFFFFF', size=12)
-        year_cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        if start_col < end_col:
+            ws.merge_cells(start_row=3, start_column=start_col, end_row=3, end_column=end_col)
+        year_cell = ws.cell(row=3, column=start_col)
+        year_cell.value = str(year)
+        year_cell.font = year_bar_font
+        year_cell.fill = year_bar_fill
         year_cell.alignment = Alignment(horizontal='center', vertical='center')
 
-    # 4. Create the Column Header (Row 2)
-    header_row = 2
+    # 4. Single column header row.
+    header_row = 4
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col_num)
         cell.value = header
-        cell.font = Font(bold=True, color='FFFFFF')
-        
-        if col_num == 1:
-            cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+        cell.font = Font(bold=True, color='FFFFFF', size=11)
+        if col_num <= 2:
+            cell.fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
         else:
             cell.fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
-        
         cell.alignment = Alignment(horizontal='center', vertical='center')
 
-    # 5. Populate the Data
+    # 5. Populate the Data.
     all_device_ids = sorted({
         int(device_id)
         for month_map in month_to_profit_loss.values()
         for device_id in month_map.keys()
     })
 
-    row_num = 3
+    data_start_row = 5
+    row_num = data_start_row
     for device_id in all_device_ids:
-        ws.cell(row=row_num, column=1).value = device_id
+        # Nr aut. - pogrubiony
+        cell_nr = ws.cell(row=row_num, column=1)
+        cell_nr.value = device_id
+        cell_nr.font = Font(bold=True)
         
-        col_idx = 2
+        # Lokalizacja automatu
+        cell_loc = ws.cell(row=row_num, column=2)
+        cell_loc.value = location_by_device.get(device_id, '')
+        
+        col_idx = 3
         for year in sorted(years_to_months.keys()):
             first_month_col = get_column_letter(col_idx)
             for m in years_to_months[year]:
@@ -4059,118 +4121,122 @@ def _create_profit_loss_summary_sheet(wb, month_to_profit_loss):
             sum_cell.value = f"=SUM({first_month_col}{row_num}:{last_month_col}{row_num})"
             sum_cell.number_format = '#,##0.00'
             col_idx += 1
-            
         row_num += 1
 
     last_data_row = row_num - 1
 
-    # Podsumowanie dla każdego miesiąca (Suma)
+    # 6. Add metric formulas (Rows 1-2) after we know last_data_row.
+    for col in range(3, len(headers) + 1):
+        col_letter = get_column_letter(col)
+        
+        # Row 1: Procent rentowności (count of profit > 0 / count of non-empty)
+        percent_formula = f"=COUNTIF({col_letter}{data_start_row}:{col_letter}{last_data_row},\">0\")/COUNTIF({col_letter}{data_start_row}:{col_letter}{last_data_row},\"<>0\")"
+        percent_cell = ws.cell(row=1, column=col)
+        percent_cell.value = percent_formula
+        percent_cell.number_format = '0.0%'
+        percent_cell.font = Font(bold=True, color='000000')
+        percent_cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Row 2: Liczba TVM rentownych (count of profit > 0)
+        count_formula = f"=COUNTIF({col_letter}{data_start_row}:{col_letter}{last_data_row},\">0\")"
+        count_cell = ws.cell(row=2, column=col)
+        count_cell.value = count_formula
+        count_cell.number_format = '0'
+        count_cell.font = Font(bold=True, color='000000')
+        count_cell.alignment = Alignment(horizontal='center', vertical='center')
+
+    # Podsumowanie dla każdego miesiąca (Suma).
     sum_row = row_num
     ws.cell(row=sum_row, column=1).value = "Suma"
     ws.cell(row=sum_row, column=1).font = Font(bold=True)
-    for col in range(2, len(headers) + 1):
+    
+    sum_fill = PatternFill(start_color='D9E8D9', end_color='D9E8D9', fill_type='solid')
+    
+    # Only fill real data columns.
+    for col in range(3, len(headers) + 1):
         col_letter = get_column_letter(col)
         cell = ws.cell(row=sum_row, column=col)
-        cell.value = f"=SUM({col_letter}3:{col_letter}{last_data_row})"
+        cell.value = f"=SUM({col_letter}{data_start_row}:{col_letter}{last_data_row})"
         cell.number_format = '#,##0.00'
         cell.font = Font(bold=True)
+        cell.fill = sum_fill
+    
+    row_num += 1
+    
+    # Dodaj wiersz ze średnią
+    average_row = row_num
+    ws.cell(row=average_row, column=1).value = "Średnia"
+    ws.cell(row=average_row, column=1).font = Font(bold=True)
+    
+    average_fill = PatternFill(start_color='D9E8D9', end_color='D9E8D9', fill_type='solid')
+
+    for col in range(3, len(headers) + 1):
+        col_letter = get_column_letter(col)
+        cell = ws.cell(row=average_row, column=col)
+        cell.number_format = '#,##0.00'
+        cell.font = Font(bold=True)
+
+        cell.value = f"=AVERAGE({col_letter}{data_start_row}:{col_letter}{last_data_row})"
+        cell.fill = average_fill
     
     row_num += 1
 
-    if last_data_row >= 2:
-        first_value_col_letter = get_column_letter(2)
-        last_value_col_letter = get_column_letter(len(headers))
-        summary_range = f"{first_value_col_letter}3:{last_value_col_letter}{last_data_row}"
+    last_used_row = row_num - 1
+    last_used_col = len(headers)
+
+    def _add_average_color_scale(row_idx, start_col, end_col):
+        if end_col <= start_col:
+            return
+
+        first_col_letter = get_column_letter(start_col)
+        last_col_letter = get_column_letter(end_col)
+        row_range = f"{first_col_letter}{row_idx}:{last_col_letter}{row_idx}"
+        average_formula = f"AVERAGE({first_col_letter}{row_idx}:{last_col_letter}{row_idx})"
 
         ws.conditional_formatting.add(
-            summary_range,
-            CellIsRule(
-                operator='lessThan',
-                formula=['-100'],
-                fill=PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),
-            ),
-        )
-        ws.conditional_formatting.add(
-            summary_range,
-            CellIsRule(
-                operator='between',
-                formula=['-100', '100'],
-                fill=PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid'),
-            ),
-        )
-        ws.conditional_formatting.add(
-            summary_range,
-            CellIsRule(
-                operator='greaterThan',
-                formula=['100'],
-                fill=PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),
+            row_range,
+            ColorScaleRule(
+                start_type='min',
+                start_color='FFC7CE',
+                mid_type='formula',
+                mid_value=average_formula,
+                mid_color='FFEB9C',
+                end_type='max',
+                end_color='C6EFCE',
             ),
         )
 
-    # Add black borders to data cells
+    # Formatowanie warunkowe dla wierszy 1-2 (per rok, na podstawie średniej wiersza)
+    for row in [1, 2]:
+        for year, (start_col, end_col) in year_to_cols.items():
+            _add_average_color_scale(row, start_col, end_col - 1)
+
+    if last_data_row >= data_start_row:
+        # Formatowanie warunkowe ColorScaleRule dla każdego wiersza (na podstawie średniej wiersza)
+        for row in range(data_start_row, last_data_row + 1):
+            for year, (start_col, end_col) in year_to_cols.items():
+                _add_average_color_scale(row, start_col, end_col - 1)
+
+    # Add black borders to data cells (now includes rows 1-2)
     thin_side = Side(style='thin', color='000000')
     thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    for row in range(2, row_num):
-        for col in range(1, len(headers) + 1):
+    for row in range(1, last_used_row + 1):
+        for col in range(1, last_used_col + 1):
             ws.cell(row=row, column=col).border = thin_border
 
-    # Tabela sezonowości
-    curr_row = row_num + 2
-    for year in sorted(years_to_months.keys()):
-        months_in_year = years_to_months[year]
-        if not months_in_year:
-            continue
+    # Add thick black border around the actual data area.
+    thick_side = Side(style='thick', color='000000')
+    for row in range(1, last_used_row + 1):
+        for col in range(3, last_used_col + 1):
+            cell = ws.cell(row=row, column=col)
             
-        start_col, end_col = year_to_cols[year]
-        
-        ws.cell(row=curr_row, column=1).value = f"Wskaźnik sezonowości Rok {year}"
-        ws.cell(row=curr_row, column=1).font = Font(bold=True)
-        ws.cell(row=curr_row+1, column=1).value = "Miesiąc"
-        ws.cell(row=curr_row+2, column=1).value = "Wynik miesięczny"
-        ws.cell(row=curr_row+3, column=1).value = "Średnia"
-        ws.cell(row=curr_row+4, column=1).value = "Odchylenie (+/-)"
-        ws.cell(row=curr_row+5, column=1).value = "Wskaźnik (%)"
-        
-        for r_offset in range(1, 6):
-            ws.cell(row=curr_row+r_offset, column=1).font = Font(bold=True)
+            # Determine which borders to apply (thick on edges, thin inside)
+            top = thick_side if row == 1 else thin_side
+            bottom = thick_side if row == last_used_row else thin_side
+            left = thick_side if col == 3 else thin_side
+            right = thick_side if col == last_used_col else thin_side
             
-        # Wypisanie miesięcy 
-        col_idx = 2
-        first_month_col_letter = get_column_letter(col_idx)
-        last_month_col_letter = get_column_letter(col_idx + len(months_in_year) - 1)
-        avg_formula = f"=AVERAGE({first_month_col_letter}{curr_row+2}:{last_month_col_letter}{curr_row+2})"
-        
-        for i, m in enumerate(months_in_year):
-            c_current = col_idx + i
-            c_letter = get_column_letter(c_current)
-            orig_col_letter = get_column_letter(start_col + i)
-            
-            # Miesiąc
-            c_month = ws.cell(row=curr_row+1, column=c_current)
-            c_month.value = _month_label_pl(m)
-            c_month.alignment = Alignment(horizontal='center')
-            
-            # Wynik miesięczny
-            c_wynik = ws.cell(row=curr_row+2, column=c_current)
-            c_wynik.value = f"={orig_col_letter}{sum_row}"
-            c_wynik.number_format = '#,##0.00'
-            
-            # Średnia
-            c_srednia = ws.cell(row=curr_row+3, column=c_current)
-            c_srednia.value = avg_formula
-            c_srednia.number_format = '#,##0.00'
-            
-            # Odchylenie
-            c_odchylenie = ws.cell(row=curr_row+4, column=c_current)
-            c_odchylenie.value = f"={c_letter}{curr_row+2}-{c_letter}{curr_row+3}"
-            c_odchylenie.number_format = '#,##0.00'
-            
-            # Wskaźnik
-            c_wskaznik = ws.cell(row=curr_row+5, column=c_current)
-            c_wskaznik.value = f"=IFERROR({c_letter}{curr_row+2}/{c_letter}{curr_row+3}, 0)"
-            c_wskaznik.number_format = '0.00%'
-            
-        curr_row += 7
+            cell.border = Border(top=top, bottom=bottom, left=left, right=right)
 
     # Remove gridlines
     ws.sheet_view.showGridLines = False
@@ -4973,7 +5039,10 @@ def export_to_excel_PL(
     for col_num in range(info_nr_col, uwagi_col_idx + 1):
         cell = ws.cell(row=header_row, column=col_num)
         cell.value = header_values.get(col_num, '')
-        cell.font = header_font
+        if col_num in (info_nr_col, info_loc_col):
+            cell.font = Font(bold=True, color='FFFFFF')
+        else:
+            cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cell.border = thin_border
@@ -5217,6 +5286,72 @@ def export_to_excel_PL(
 
         row_num += 1
 
+    def _add_monthly_kpi_box(start_row):
+        label_col = 13  # M
+        value_col = 14  # N
+        end_row = start_row + 1
+        data_range = 'N3:N113'
+
+        label_fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+        value_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+        count_fill = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
+        label_font = Font(bold=True, color='FFFFFF')
+        value_font = Font(bold=True)
+        thick_side = Side(style='medium', color='000000')
+        thin_side = Side(style='thin', color='000000')
+
+        def _set_box_cell(row_idx, col_idx, *, value=None, fill=None, font=None, number_format=None):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.fill = fill
+            cell.font = font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = Border(
+                left=thick_side if col_idx == label_col else thin_side,
+                right=thick_side if col_idx == value_col else thin_side,
+                top=thick_side if row_idx == start_row else thin_side,
+                bottom=thick_side if row_idx == end_row else thin_side,
+            )
+            if number_format is not None:
+                cell.number_format = number_format
+            return cell
+
+        _set_box_cell(
+            start_row,
+            label_col,
+            value='Rentowność TVM',
+            fill=label_fill,
+            font=label_font,
+        )
+        _set_box_cell(
+            start_row,
+            value_col,
+            value=f'=N{end_row}/COUNTIF({data_range},"<>0")',
+            fill=value_fill,
+            font=value_font,
+            number_format='0.00%',
+        )
+        _set_box_cell(
+            end_row,
+            label_col,
+            value='Ilość TVM',
+            fill=label_fill,
+            font=label_font,
+        )
+        _set_box_cell(
+            end_row,
+            value_col,
+            value=f'=COUNTIF({data_range},">0")',
+            fill=count_fill,
+            font=value_font,
+            number_format='#,##0',
+        )
+
+        ws.row_dimensions[start_row].height = 20
+        ws.row_dimensions[end_row].height = 20
+
+    if last_data_row >= 2:
+        _add_monthly_kpi_box(row_num + 1)
+
     if last_data_row >= 2:
         result_col_letter = get_column_letter(result_col_idx)
         result_range = f"{result_col_letter}{data_start_row}:{result_col_letter}{last_data_row}"
@@ -5335,11 +5470,14 @@ def export_to_excel_PL(
     }
 
 
-def _create_tickets_summary_sheet(wb, month_to_tickets):
+def _create_tickets_summary_sheet(wb, month_to_tickets, location_by_device=None):
     """
     Tworzy arkusz zbiorczy wg. biletów z podziałem na automat / miesiąc.
     Kolorowanie (ColorScale = Red>Yellow>Green) odbywa się na poziomie pojedynczego wiersza.
     """
+    if location_by_device is None:
+        location_by_device = {}
+    
     ws = wb.create_sheet(title='Tickets_Summary')
     ordered_months = sorted(month_to_tickets.keys())
 
@@ -5350,10 +5488,10 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
         years_to_months.setdefault(year, []).append(m)
 
     # Build headers with per-year grouped months and yearly SUM, plus final Average
-    headers = ['Nr aut.']
+    headers = ['Nr aut.', 'Lokalizacja automatu']
     month_col_positions = {}
     year_to_cols = {}
-    current_col = 2
+    current_col = 3
     for year in sorted(years_to_months.keys()):
         start_col = current_col
         for m in years_to_months[year]:
@@ -5370,6 +5508,11 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
     # Create year header row with merged cells
     ws.cell(row=1, column=1).value = ''
     ws.cell(row=1, column=1).fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
+    
+    # Add black fill for "Średnia" column (last column in row 1)
+    average_col = len(headers)
+    ws.cell(row=1, column=average_col).fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+    
     for year, (start_col, end_col) in year_to_cols.items():
         if start_col == end_col:
             year_cell = ws.cell(row=1, column=start_col)
@@ -5390,8 +5533,8 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
     for col_num, header in enumerate(headers, 1):
         cell = ws.cell(row=header_row, column=col_num)
         cell.value = header
-        if col_num == 1:
-            cell.font = Font(bold=True, color='FFFFFF')
+        if col_num <= 2:
+            cell.font = Font(bold=True, color='000000')
             cell.fill = PatternFill(start_color='2F5597', end_color='2F5597', fill_type='solid')
         elif header in ('Zestawienie roczne (+/-)', 'Średnia'):
             cell.font = sum_font
@@ -5410,8 +5553,16 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
     row_num = 3
     total_months = len(ordered_months)
     for device_id in all_device_ids:
-        ws.cell(row=row_num, column=1).value = device_id
-        col_idx = 2
+        # Nr aut. - pogrubiony
+        cell_nr = ws.cell(row=row_num, column=1)
+        cell_nr.value = device_id
+        cell_nr.font = Font(bold=True)
+        
+        # Lokalizacja automatu
+        cell_loc = ws.cell(row=row_num, column=2)
+        cell_loc.value = location_by_device.get(device_id, '')
+        
+        col_idx = 3
         # Fill monthly values grouped by year and insert yearly SUM formula
         for year in sorted(years_to_months.keys()):
             first_month_col = get_column_letter(col_idx)
@@ -5433,8 +5584,8 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
 
         # Average across all month columns (exclude the yearly SUM columns)
         if total_months > 0:
-            first_value_col_letter = get_column_letter(2)
-            last_month_col_letter = get_column_letter(2 + total_months - 1)
+            first_value_col_letter = get_column_letter(3)
+            last_month_col_letter = get_column_letter(3 + total_months - 1)
             avg_cell = ws.cell(row=row_num, column=col_idx)
             avg_cell.value = f'=AVERAGEIF({first_value_col_letter}{row_num}:{last_month_col_letter}{row_num}, "<>0")'
             avg_cell.number_format = '#,##0.00'
@@ -5442,28 +5593,61 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
             avg_cell.font = sum_font
             avg_cell.alignment = sum_data_alignment
 
-        # Color scale for monthly values only (exclude yearly and average columns)
-        if total_months > 1:
+        row_num += 1
+
+    last_data_row = row_num - 1
+    
+    # Zastosuj formatowanie warunkowe ColorScaleRule dla każdego wiersza (na podstawie średniej wiersza)
+    if total_months > 1 and last_data_row >= 3:
+        for row in range(3, last_data_row + 1):
             for year in sorted(years_to_months.keys()):
                 month_cols = [month_col_positions[m] for m in years_to_months[year] if m in month_col_positions]
                 if len(month_cols) <= 1:
                     continue
-                year_month_range = f"{get_column_letter(month_cols[0])}{row_num}:{get_column_letter(month_cols[-1])}{row_num}"
-                scale_rule = ColorScaleRule(start_type='min', start_color='FFC7CE',
-                                            mid_type='percentile', mid_value=50, mid_color='FFEB9C',
-                                            end_type='max', end_color='C6EFCE')
-                ws.conditional_formatting.add(year_month_range, scale_rule)
-
-        row_num += 1
-
-    last_data_row = row_num - 1
+                
+                # Zbierz wartości dla tego wiersza i roku
+                row_values = []
+                for col_idx in month_cols:
+                    cell_value = ws.cell(row=row, column=col_idx).value
+                    if cell_value is not None and isinstance(cell_value, (int, float)):
+                        row_values.append(cell_value)
+                
+                if not row_values or len(row_values) < 2:
+                    continue
+                
+                # Oblicz min i max dla tego wiersza w tym roku
+                row_min = min(row_values)
+                row_max = max(row_values)
+                row_mid = (row_min + row_max) / 2
+                
+                # Zastosuj ColorScaleRule do zakresu tego wiersza i roku
+                first_col = get_column_letter(month_cols[0])
+                last_col = get_column_letter(month_cols[-1])
+                row_range = f"{first_col}{row}:{last_col}{row}"
+                
+                ws.conditional_formatting.add(
+                    row_range,
+                    ColorScaleRule(
+                        start_type='num',
+                        start_value=row_min,
+                        start_color='FFC7CE',  # Red dla min
+                        mid_type='num',
+                        mid_value=row_mid,
+                        mid_color='FFEB9C',  # Yellow dla mid
+                        end_type='num',
+                        end_value=row_max,
+                        end_color='C6EFCE',  # Green dla max
+                    ),
+                )
 
     # Podsumowanie dla każdego miesiąca (Suma)
     sum_row = row_num
     ws.cell(row=sum_row, column=1).value = "Suma biletów"
     ws.cell(row=sum_row, column=1).font = sum_font
     ws.cell(row=sum_row, column=1).fill = sum_fill
-    for col in range(2, len(headers) + 1):
+    
+    # Fill columns 3 to len(headers), excluding the last column (V)
+    for col in range(3, len(headers)):  # Changed: len(headers) instead of len(headers)+2
         col_letter = get_column_letter(col)
         cell = ws.cell(row=sum_row, column=col)
         cell.value = f"=SUM({col_letter}3:{col_letter}{last_data_row})"
@@ -5475,27 +5659,57 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
 
     row_num += 1
 
+    # === NOWE FORMATOWANIE TICKETS_SUMMARY ===
+    
+    # 1. A1, B1 - czarne i puste
+    black_fill = PatternFill(start_color='000000', end_color='000000', fill_type='solid')
+    for col in [1, 2]:
+        cell = ws.cell(row=1, column=col)
+        cell.value = None
+        cell.fill = black_fill
+    
+    # 2. A2:B129 - szarą fill (Biały 15% ciemniejszy)
+    gray_fill = PatternFill(start_color='E6E6E6', end_color='E6E6E6', fill_type='solid')
+    for row in range(2, 130):
+        for col in [1, 2]:
+            cell = ws.cell(row=row, column=col)
+            cell.fill = gray_fill
+    
+    # 3. B130 - czarny i pusty
+    b130 = ws.cell(row=130, column=2)
+    b130.value = None
+    b130.fill = black_fill
+    
+    # 4. Przygotuj style krawędzi
     thin_side = Side(style='thin', color='000000')
+    thick_side = Side(style='thick', color='000000')
     thin_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-    for row in range(2, row_num):
-        for col in range(1, len(headers) + 1):
+    
+    # 5. Najpierw ustaw cienkie krawędzie wszędzie
+    for row in range(1, 131):
+        for col in range(1, len(headers)):
             ws.cell(row=row, column=col).border = thin_border
-
-    # Additional April conditional formatting (column-wise, per each April present)
-    april_months = [m for m in ordered_months if m.endswith('-04')]
-    if row_num > 3:
-        for april_month in april_months:
-            april_col = month_col_positions.get(april_month)
-            if april_col is None:
-                continue
-            april_range = f"{get_column_letter(april_col)}3:{get_column_letter(april_col)}{row_num - 1}"
-            april_scale = ColorScaleRule(start_type='min', start_color='FFC7CE',
-                                         mid_type='percentile', mid_value=50, mid_color='FFEB9C',
-                                         end_type='max', end_color='C6EFCE')
-            ws.conditional_formatting.add(april_range, april_scale)
+    
+    # 6. Grube czarne obramowanie dla każdego roku (na podstawie year_to_cols)
+    for year, (start_col, end_col) in year_to_cols.items():
+        for row in range(1, 131):
+            for col in range(start_col, end_col + 1):
+                cell = ws.cell(row=row, column=col)
+                top = thick_side if row == 1 else thin_side
+                bottom = thick_side if row == 130 else thin_side
+                left = thick_side if col == start_col else thin_side
+                right = thick_side if col == end_col else thin_side
+                cell.border = Border(top=top, bottom=bottom, left=left, right=right)
+    
+    # 7. Kolumna Średnia - czarne wszystkie krawędzie grube
+    average_col = len(headers)
+    thick_border = Border(top=thick_side, bottom=thick_side, left=thick_side, right=thick_side)
+    for row in range(1, 131):
+        cell = ws.cell(row=row, column=average_col)
+        cell.border = thick_border
 
     # Adjust column widths (10% extra margin)
-    for col in range(1, len(headers) + 1):
+    for col in range(1, len(headers) + 2):
         max_len = 0
         for row in range(2, row_num):
             cell_value = ws.cell(row=row, column=col).value
@@ -5503,63 +5717,6 @@ def _create_tickets_summary_sheet(wb, month_to_tickets):
                 max_len = max(max_len, len(str(cell_value)))
         if max_len > 0:
             ws.column_dimensions[get_column_letter(col)].width = max_len * 1.1
-
-    # Tabela sezonowości
-    curr_row = row_num + 2
-    for year in sorted(years_to_months.keys()):
-        months_in_year = years_to_months[year]
-        if not months_in_year:
-            continue
-            
-        start_col, end_col = year_to_cols[year]
-        
-        ws.cell(row=curr_row, column=1).value = f"Wskaźnik sezonowości Rok {year}"
-        ws.cell(row=curr_row, column=1).font = Font(bold=True)
-        ws.cell(row=curr_row+1, column=1).value = "Miesiąc"
-        ws.cell(row=curr_row+2, column=1).value = "Suma biletów"
-        ws.cell(row=curr_row+3, column=1).value = "Średnia miesięczna z przypisanych"
-        ws.cell(row=curr_row+4, column=1).value = "Odchylenie (+/-)"
-        ws.cell(row=curr_row+5, column=1).value = "Wskaźnik (%)"
-        
-        for r_offset in range(1, 6):
-            ws.cell(row=curr_row+r_offset, column=1).font = Font(bold=True)
-            
-        col_idx = 2
-        first_month_col_letter = get_column_letter(col_idx)
-        last_month_col_letter = get_column_letter(col_idx + len(months_in_year) - 1)
-        avg_formula = f'=AVERAGEIF({first_month_col_letter}{curr_row+2}:{last_month_col_letter}{curr_row+2}, "<>0")'
-        
-        for i, m in enumerate(months_in_year):
-            c_current = col_idx + i
-            c_letter = get_column_letter(c_current)
-            orig_col_letter = get_column_letter(start_col + i)
-            
-            # Miesiąc
-            c_month = ws.cell(row=curr_row+1, column=c_current)
-            c_month.value = _month_label_pl(m)
-            c_month.alignment = Alignment(horizontal='center')
-            
-            # Suma biletów
-            c_wynik = ws.cell(row=curr_row+2, column=c_current)
-            c_wynik.value = f"={orig_col_letter}{sum_row}"
-            c_wynik.number_format = '#,##0'
-            
-            # Średnia
-            c_srednia = ws.cell(row=curr_row+3, column=c_current)
-            c_srednia.value = avg_formula
-            c_srednia.number_format = '#,##0.00'
-            
-            # Odchylenie
-            c_odchylenie = ws.cell(row=curr_row+4, column=c_current)
-            c_odchylenie.value = f"={c_letter}{curr_row+2}-{c_letter}{curr_row+3}"
-            c_odchylenie.number_format = '#,##0.00'
-            
-            # Wskaźnik
-            c_wskaznik = ws.cell(row=curr_row+5, column=c_current)
-            c_wskaznik.value = f"=IFERROR({c_letter}{curr_row+2}/{c_letter}{curr_row+3}, 0)"
-            c_wskaznik.number_format = '0.00%'
-            
-        curr_row += 7
 
     ws.sheet_view.showGridLines = False
 
@@ -5670,6 +5827,62 @@ def _create_wyszukiwarka_sheet(wb):
     ws.sheet_view.showGridLines = False
 
 
+def _merge_location_history_by_device(month_payloads):
+    """
+    Łączy lokalizacje per automat z kolejnych miesięcy w porządku chronologicznym.
+    Zwraca dict {device_id: 'lokalizacja1/lokalizacja2/...'}.
+    Jeśli jedna nazwa jest krótszym prefiksem bardziej szczegółowej nazwy,
+    zachowuje tylko tę bardziej szczegółową.
+    """
+    def _location_compare_key(value):
+        normalized_value = _normalize_tvm_location_text(value)
+        if not normalized_value:
+            return ''
+        normalized_value = unicodedata.normalize('NFKD', normalized_value)
+        normalized_value = ''.join(ch for ch in normalized_value if not unicodedata.combining(ch))
+        return re.sub(r'[^A-Z0-9]+', '', normalized_value.upper())
+
+    def _is_prefix_variant(shorter, longer):
+        shorter_key = _location_compare_key(shorter)
+        longer_key = _location_compare_key(longer)
+        return bool(shorter_key and longer_key and shorter_key != longer_key and longer_key.startswith(shorter_key))
+
+    merged_locations = {}
+
+    for month_str, payload in sorted(list(month_payloads), key=lambda item: item[0]):
+        location_map = (payload or {}).get('location_by_device') or {}
+        for device_id, location in location_map.items():
+            normalized_location = _normalize_tvm_location_text(location)
+            if not normalized_location:
+                continue
+
+            device_id_int = int(device_id)
+            normalized_key = _location_compare_key(normalized_location)
+            if not normalized_key:
+                continue
+
+            merged_for_device = merged_locations.setdefault(device_id_int, [])
+
+            if any(_location_compare_key(existing_location) == normalized_key for existing_location in merged_for_device):
+                continue
+
+            merged_for_device[:] = [
+                existing_location
+                for existing_location in merged_for_device
+                if not _is_prefix_variant(existing_location, normalized_location)
+            ]
+
+            if any(_is_prefix_variant(normalized_location, existing_location) for existing_location in merged_for_device):
+                continue
+
+            merged_for_device.append(normalized_location)
+
+    return {
+        device_id: '/'.join(locations)
+        for device_id, locations in merged_locations.items()
+    }
+
+
 def export_multi_month_PL(
     dictionary_comparison,
     month_payloads,
@@ -5688,10 +5901,20 @@ def export_multi_month_PL(
     filepath = OUTPUT_DIR / filename
     wb = Workbook()
 
+    month_payloads = sorted(list(month_payloads), key=lambda item: item[0])
+
+    month_to_tickets = {}
+    month_to_profit_loss = {}
+    location_by_device = {}
+    summary_location_by_device = _merge_location_history_by_device(month_payloads)
+
     for month_str, payload in month_payloads:
         warehouse_ids = payload.get('warehouse_device_ids') or set()
+        # Zbierz mapę lokalizacji z pierwszego payload'u do użytku w arkuszu Wyszukiwarka.
+        if not location_by_device and payload.get('location_by_device'):
+            location_by_device = payload.get('location_by_device') or {}
 
-        export_to_excel_PL(
+        res = export_to_excel_PL(
             dictionary_comparison,
             payload['revenue_data'],
             month_str,
@@ -5714,6 +5937,18 @@ def export_multi_month_PL(
             warehouse_device_ids=warehouse_ids,
             included_device_ids=payload.get('included_device_ids') or [],
         )
+
+        # Collect per-month aggregates for summary sheets (when export_to_excel_PL returns them)
+        if isinstance(res, dict):
+            month_to_tickets[month_str] = res.get('tickets_by_device', {})
+            month_to_profit_loss[month_str] = res.get('profit_loss_by_device', {})
+
+    # Create summary sheets if we have aggregated data
+    if month_to_tickets:
+        _create_tickets_summary_sheet(wb, month_to_tickets, location_by_device=summary_location_by_device)
+    if month_to_profit_loss:
+        _create_profit_loss_summary_sheet(wb, month_to_profit_loss, location_by_device=summary_location_by_device)
+
     _create_wyszukiwarka_sheet(wb)
     
     # Zapisz jako .xlsx najpierw
@@ -6167,7 +6402,7 @@ def main():
     parser.add_argument(
         '--month-payload-source',
         choices=['auto', 'fresh', 'cache-only', 'no-cache'],
-        default='fresh',
+        default='auto',
         help='Źródło payloadu miesięcznego: auto (cache z fallback), fresh (pełne pobranie + zapis cache), cache-only (tylko cache), no-cache (pełne pobranie bez odczytu i bez zapisu cache)'
     )
     parser.add_argument(
